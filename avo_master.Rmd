@@ -1,0 +1,3631 @@
+---
+title: "Influence of empirically derived filtering parameters, ASV, and OTU pipelines on assessing rumen microbial diversity"
+author: "Wesley A. Tom"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=F}
+library(knitr)
+knitr::opts_chunk$set(echo = T)
+setwd("~/Desktop/AVO_git/") #change to wherever you downloaded the directory
+```
+
+## R Markdown for ASV OTU filtration
+an exploration of the effects empirical filtration 16S rRNA V4 region marker gene seqeuencing of the rumen microbiome in Holstein and Jersey Dairy Cattle.
+
+```{r, warning=F, echo=F}
+
+#Load libraries common to microbiome marke gene analysis
+library(dada2)
+library(ggplot2)
+library(vegan)
+library(dplyr)
+library(scales)
+library(grid)
+library(reshape2)
+library(phyloseq)
+library(ggplot2)
+library(ggrepel)
+library(vegan)
+library(dplyr)
+library(scales)
+library(grid)
+library(reshape2)
+library(phyloseq)
+library(metagenomeSeq)
+library(micropower)
+library(randomForest)
+library(ggpubr)
+library(knitr)
+library(kableExtra)
+library(Biostrings)
+library(tidytree)
+library(ggtree)
+library(cowplot)
+library(wesanderson)
+library(gridExtra)
+library(tidyverse)
+library(ampvis2)
+library(microViz)
+library(treeio)
+library(genefilter)
+library(plyr)
+library(data.table)
+library(ranacapa)
+```
+
+```{r message=F, warning=F, echo=F}
+## functions useful in analyzing microbiome data
+
+## ggplot2 theme
+################################################################################
+plotTextSize = 9
+legTextSize = 7
+theme_set(theme_bw() + 
+            theme(text = element_text(size = plotTextSize),
+                  legend.text = element_text(size = legTextSize),
+                  legend.position = "top",
+                  legend.direction = "horizontal",
+                  legend.margin = margin(t = 0, b = -0.75, unit='line'),
+                  axis.title.x = element_text(margin=margin(0.3, 0, 0, 0, unit = "lines")),
+                  axis.title.y = element_text(margin=margin(0, 0.3, 0, 0, unit = "lines")),
+                  panel.spacing = margin(t = 0, unit='line'),
+                  plot.margin = unit(x = c(0.25, 0.2, 0.5, 0.1),
+                                     units="line")
+            )
+)
+tumorPalette = c(Healthy = "chartreuse4",
+                 Tumor = "lightgray")
+library(wesanderson)
+pal <- wes_palette("Zissou1", 100, type = "continuous")
+pal2 <- wes_palette("Cavalcanti1",100,type="continuous")
+pal3 <- c(wes_palette("Royal1", type = "discrete"),
+          wes_palette("Chevalier1", type = "discrete"),
+          wes_palette("FantasticFox1",type = "discrete"),
+          wes_palette("IsleofDogs1", type = "discrete"),
+          wes_palette("BottleRocket1", type = "discrete"),
+          wes_palette("Rushmore1", type = "discrete"),
+          wes_palette("Darjeeling1", type = "discrete"),
+          wes_palette("Moonrise1", type = "discrete"),
+          wes_palette("GrandBudapest1", type = "discrete"),
+          wes_palette("Cavalcanti1", type = "discrete"))
+################################################################################
+# A custom geometric mean function, with zero/NA tolerance.
+gm_mean = function(x, na.rm=T){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+################################################################################
+# phyloseq_CLR code
+# Requires zCompositions package
+################################################################################
+zero_comp = function(x){
+  if(taxa_are_rows(x)){x <- t(x)}
+  matx = otu_table(x)
+  # `zCompositions::cmultRepl` expects the samples to be in rows and OTUs to be in columns 
+  matxzc = zCompositions::cmultRepl(matx, method="CZM", output="counts")
+  otu_table(x) <- otu_table(matxzc, taxa_are_rows = F)
+  return(x)
+}
+# CLR definition
+geometric_mean = function(x){
+  exp(mean(log(x)))
+}
+clr = function(x, base=2){
+  x <- log((x / geometric_mean(x)), base)
+}
+phyloseq_CLR = function(physeq){
+  suppressMessages({physeq <- zero_comp(physeq)})
+  return(transform_sample_counts(physeq, fun = clr))
+}
+################################################################################
+# Plot table of significance values
+#
+plot_deseq = function(dsdf, alpha = 0.1){
+  # Phylum order
+  x = tapply(dsdf$log2FoldChange, dsdf$Phylum, function(x){max(x)})
+  x = sort(x, T)
+  dsdf$Phylum <- factor(as.character(dsdf$Phylum), levels=names(x))
+  # Genus order
+  x = tapply(dsdf$log2FoldChange, dsdf$Genus, function(x){max(x)})
+  x = sort(x, T)
+  dsdf$Genus <- factor(as.character(dsdf$Genus), levels=names(x))
+  # Define the special points worth highlighting
+  specialdf = dsdf[(dsdf$pvalue < alpha), ]
+  specialdf$OTU <- row.names(specialdf)
+  # Now define the ggplot2 object.
+  p = ggplot(
+    data = dsdf, 
+    mapping = aes(x = log2FoldChange,
+                  y = -log10(pvalue),
+                  size = -log10(pvalue))
+    ) + 
+    geom_vline(xintercept = 0.0, linetype = 2) +
+      # the background of all results
+    geom_point(color = "black", alpha = 0.65) + 
+      # the few interesting, borderline significant results
+    geom_point(data = specialdf,
+               mapping = aes(color = Family)) +
+    geom_text_repel(data = specialdf,
+                    mapping = aes(label = paste(OTU, Genus))) +
+    scale_size_continuous(range = c(1, 4)) +
+    guides(size=F) +
+    # axis labels
+    labs(y = expression(-log[10](p)),
+         x = expression(log[2](FC)))
+  return(p)
+}
+
+################################################################################
+# Ordination standard plot theme.
+################################################################################
+add_theme = function(p, pt.sz = 3){
+  require("ggplot2")
+  # guides(fill=F)
+  # Add consistent layers/themes
+  p + 
+    geom_point(mapping = aes(shape = DIAGNOSIS, 
+                             color = DIAGNOSIS),
+               size = pt.sz, alpha = 1) + 
+    geom_path(aes(group = HOST_SUBJECT_ID), 
+              color = "black", 
+              size = 0.25) +
+    scale_colour_manual(values = tumorPalette) +
+    theme(text = element_text(size = legTextSize),
+          legend.position="none")
+}
+################################################################################
+#function to convert phyloseq object to ampvis2 object:
+################################################################################
+phyloseq_to_ampvis2 <- function(physeq) {
+  #check object for class
+  if(!any(class(physeq) %in% "phyloseq"))
+    stop("physeq object must be of class \"phyloseq\"", call. = F)
+  
+  #ampvis2 requires taxonomy and abundance table, phyloseq checks for the latter
+  if(is.null(physeq@tax_table))
+    stop("No taxonomy found in the phyloseq object and is required for ampvis2", call. = F)
+  
+  #OTUs must be in rows, not columns
+  if(phyloseq::taxa_are_rows(physeq))
+    abund <- as.data.frame(phyloseq::otu_table(physeq)@.Data)
+  else
+    abund <- as.data.frame(t(phyloseq::otu_table(physeq)@.Data))
+  
+  #tax_table is assumed to have OTUs in rows too
+  tax <- phyloseq::tax_table(physeq)@.Data
+  
+  #merge by rownames (OTUs)
+  otutable <- merge(
+    abund,
+    tax,
+    by = 0,
+    all.x = T,
+    all.y = F,
+    sort = F
+  )
+  colnames(otutable)[1] <- "OTU"
+  
+  #extract sample_data (metadata)
+  if(!is.null(physeq@sam_data)) {
+    metadata <- data.frame(
+      phyloseq::sample_data(physeq),
+      row.names = phyloseq::sample_names(physeq), 
+      stringsAsFactors = F, 
+      check.names = F
+    )
+    
+    #check if any columns match exactly with rownames
+    #if none matched assume row names are sample identifiers
+    samplesCol <- unlist(lapply(metadata, function(x) {
+      identical(x, rownames(metadata))}))
+    
+    if(any(samplesCol)) {
+      #error if a column matched and it's not the first
+      if(!samplesCol[[1]])
+        stop("Sample ID's must be in the first column in the sample metadata, please reorder", call. = F)
+    } else {
+      #assume rownames are sample identifiers, merge at the end with name "SampleID"
+      if(any(colnames(metadata) %in% "SampleID"))
+        stop("A column in the sample metadata is already named \"SampleID\" but does not seem to contain sample ID's", call. = F)
+      metadata$SampleID <- rownames(metadata)
+      
+      #reorder columns so SampleID is the first
+      metadata <- metadata[, c(which(colnames(metadata) %in% "SampleID"), 1:(ncol(metadata)-1L)), drop = F]
+    }
+  } else
+    metadata <- NULL
+  
+  #extract phylogenetic tree, assumed to be of class "phylo"
+  if(!is.null(physeq@phy_tree)) {
+    tree <- phyloseq::phy_tree(physeq)
+  } else
+    tree <- NULL
+  
+  #extract OTU DNA sequences, assumed to be of class "XStringSet"
+  if(!is.null(physeq@refseq)) {
+    #convert XStringSet to DNAbin using a temporary file (easiest)
+    fastaTempFile <- tempfile(pattern = "ampvis2_", fileext = ".fa")
+    Biostrings::writeXStringSet(physeq@refseq, filepath = fastaTempFile)
+  } else
+    fastaTempFile <- NULL
+  
+  #load as normally with amp_load
+  ampvis2::amp_load(
+    otutable = otutable,
+    metadata = metadata,
+    tree = tree,
+    fasta = fastaTempFile
+  )
+}
+
+################################################################################################
+```
+
+### Read processing
+Raw fastq files from this study are available from NCBIs SRA archive under project number: PRJNA1082806 . There are several batch files for processing reads. They are provided in this repository for convenience.SILVA ribosomal database version 138 was used in this analysis and the taxonomy files and alignments are also stored in the repository. You will need to replace the directory paths to match where your download is stored.
+
+mothur analysis was done on UNLs HCC hpc with the following batch script:
+
+`~/mothur/mothur mothur.batch` #be sure to adjust directory file paths in the batch file
+
+Usearch otu classification was performed using the following commands on the HCC's hpc
+which had a 64bit usearch license:
+
+`bash /usearch.sh`
+
+DADA2 asv classification:
+```{r, eval=F}
+path2 <-"fastq/"
+list.files(path2)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs2 <- sort(list.files(path2, pattern="_R1_001.fastq", full.names = T))
+fnRs2 <- sort(list.files(path2, pattern="_R2_001.fastq", full.names = T))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names2 <- sapply(strsplit(basename(fnFs2), "_"), `[`, 1)
+
+bact_1502_fqplot <- plotQualityProfile(fnFs2[1:20])
+print(bact_1502_fqplot)
+bact_1502_fqplotrev <- plotQualityProfile(fnRs2[1:20])
+print(bact_1502_fqplotrev)
+
+#ggsave("read1_qualplot.tiff", bact_1502_fqplot, device = 'tiff', dpi=350 )
+#ggsave("read2_qualplot.tiff", bact_1502_fqplotrev, device = 'tiff', dpi=350 )
+# Trim at 250bp F and 150bp R and run DADA2
+
+
+# Place filtered files in filtered/ subdirectory
+filtFs2 <- file.path(path2, "filtered", paste0(sample.names2, "_F_filt.fastq.gz"))
+filtRs2 <- file.path(path2, "filtered", paste0(sample.names2, "_R_filt.fastq.gz"))
+names(filtFs2) <- sample.names2
+names(filtRs2) <- sample.names2
+
+out2 <- filterAndTrim(fnFs2, filtFs2, fnRs2, filtRs2, truncLen=c(250,150),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=T,
+                     compress=T, multithread=T) # On Windows set multithread=F
+head(out2)
+#dereplicate sequences
+derepFs2 <- derepFastq(filtFs2, verbose=T)
+derepRs2 <- derepFastq(filtRs2, verbose=T)
+
+# Name the derep-class objects by the sample names
+names(derepFs2) <- sample.names2
+names(derepRs2) <- sample.names2
+
+errF2 <- learnErrors(filtFs2, multithread=T)
+errR2 <- learnErrors(filtRs2, multithread=T)
+
+bact_1502_errplot <- plotErrors(errF2, nominalQ=T)
+print(bact_1502_errplot)
+
+dadaFs2 <- dada(derepFs2, err=errF2, multithread=T)
+dadaRs2 <- dada(derepRs2, err=errR2, multithread=T)
+mergers2 <- mergePairs(dadaFs2, derepFs2, dadaRs2, derepRs2, verbose=T)
+
+# Inspect the merger data.frame from the first sample
+head(mergers2[[1]])
+seqtab2 <- makeSequenceTable(mergers2)
+dim(seqtab2)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab2)))
+seqtab.nochim2 <- removeBimeraDenovo(seqtab2, method="consensus", multithread=T, verbose=T)
+dim(seqtab.nochim2)
+getN2 <- function(x) sum(getUniques(x))
+track2 <- cbind(out2, sapply(dadaFs2, getN2), sapply(dadaRs2, getN2), sapply(mergers2, getN2), rowSums(seqtab.nochim2))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track2) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track2) <- sample.names2
+head(track2)
+
+taxa2 <- assignTaxonomy(seqtab.nochim2,"silva.nr_v138/silva_nr_v138_train_set.fa.gz", multithread=T, tryRC = T)
+taxa2 <- addSpecies(taxa2, "silva.nr_v138/silva_species_assignment_v138.fa.gz")
+taxa.print2 <- taxa2 # Removing sequence rownames for display only
+rownames(taxa.print2) <- NULL
+head(taxa.print2)
+```
+
+Negative control data with dada2:
+
+```{r,eval=F warning=F, message=F}
+path3 <-"negative_control/"
+list.files(path3)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs3 <- sort(list.files(path3, pattern="_R1_001.fastq", full.names = T))
+fnRs3 <- sort(list.files(path3, pattern="_R2_001.fastq", full.names = T))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names3 <- sapply(strsplit(basename(fnFs3), "_"), `[`, 1)
+
+bact_1502_fqplot <- plotQualityProfile(fnFs3[1:20])
+print(bact_1502_fqplot)
+bact_1502_fqplotrev <- plotQualityProfile(fnRs3[1:20])
+print(bact_1502_fqplotrev)
+
+#ggsave("read1_qualplot.tiff", bact_1502_fqplot, device = 'tiff', dpi=350 )
+#ggsave("read2_qualplot.tiff", bact_1502_fqplotrev, device = 'tiff', dpi=350 )
+# Trim at 250bp F and 150bp R and run DADA2
+
+
+# Place filtered files in filtered/ subdirectory
+filtFs3 <- file.path(path3, "filtered", paste0(sample.names3, "_F_filt.fastq.gz"))
+filtRs3 <- file.path(path3, "filtered", paste0(sample.names3, "_R_filt.fastq.gz"))
+names(filtFs3) <- sample.names3
+names(filtRs3) <- sample.names3
+
+out3 <- filterAndTrim(fnFs3, filtFs3, fnRs3, filtRs3, truncLen=c(200,100),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=T,
+                     compress=T, multithread=T) # On Windows set multithread=F
+head(out3)
+#dereplicate sequences
+derepFs3 <- derepFastq(filtFs3, verbose=T)
+derepRs3 <- derepFastq(filtRs3, verbose=T)
+
+# Name the derep-class objects by the sample names
+names(derepFs3) <- sample.names3
+names(derepRs3) <- sample.names3
+
+errF3 <- learnErrors(filtFs3, multithread=T)
+errR3 <- learnErrors(filtRs3, multithread=T)
+
+bact_1502_errplot <- plotErrors(errF3, nominalQ=T)
+print(bact_1502_errplot)
+
+dadaFs3 <- dada(derepFs3, err=errF3, multithread=T)
+dadaRs3 <- dada(derepRs3, err=errR3, multithread=T)
+mergers3 <- mergePairs(dadaFs3, derepFs3, dadaRs3, derepRs3, verbose=T)
+
+# Inspect the merger data.frame from the first sample
+head(mergers3[[1]])
+seqtab3 <- makeSequenceTable(mergers3)
+dim(seqtab3)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab3)))
+seqtab.nochim3 <- removeBimeraDenovo(seqtab3, method="consensus", multithread=T, verbose=T)
+dim(seqtab.nochim3)
+getN3 <- function(x) sum(getUniques(x))
+track3 <- cbind(out3, sapply(dadaFs3, getN3), sapply(dadaRs3, getN3), sapply(mergers3, getN3), rowSums(seqtab.nochim3))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track3) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track3) <- sample.names3
+head(track3)
+
+taxa3 <- assignTaxonomy(seqtab.nochim3,"silva.nr_v138/silva_nr_v138_train_set.fa.gz", multithread=T, tryRC = T)
+taxa3 <- addSpecies(taxa3, "silva.nr_v138/silva_species_assignment_v138.fa.gz")
+taxa.print3 <- taxa3 # Removing sequence rownames for display only
+rownames(taxa.print3) <- NULL
+head(taxa.print3)
+
+nc_map = read.table('nc_map.txt',sep = "\t",header = T, row.names = 1)
+nc_map = sample_data(nc_map)
+
+nc_otu_tab <- otu_table(seqtab.nochim3, taxa_are_rows = F)
+
+nc_tax_tab <- tax_table(taxa3)
+```
+
+### Load in the processed data: OTUs, Taxonomy, Fasta seqs, and metadata
+
+The resulting files output from processing were used for analysis. Here we read in the data from dada2, mothur, and usearch and create some phyloseq and ampviz objects linking taxonomy, asv/otu counts, and metadata. We then did the baseline filtration of Eukaryotes, Cyanobacteria and taxa unknown at the phylum level, eventually culminating in some mock cummunity based filtering, then we compare these methods in rumen 16S V4 microbiome data:
+```{r message=F, warning=F, echo = T}
+#read in the datasets:
+
+db_ps <- readRDS("bact1502_ps.rds")
+
+db_ps
+db_dna <- Biostrings::DNAStringSet(taxa_names(db_ps))
+names(db_dna) <- taxa_names(db_ps)
+db_ps <- merge_phyloseq(db_ps, db_dna)
+taxa_names(db_ps) <- paste0("ASV", seq(ntaxa(db_ps)))
+db_ps
+
+# create the baseline filtration dataset filtering for Ekaryotic taxa, Cyanobacteria, and Unknown taxa at the phylum level:
+db_ps2 <- subset_taxa(db_ps, Kingdom != c("Eukaryota","unknown ","unknown"))
+db_ps2 <- subset_taxa(db_ps2, Phylum != c("Cyanobacteria","unknown_unclassified"))
+db_ps2 <- subset_taxa(db_ps2, Family != c("unknown_unclassified"))
+db_ps2 <- prune_samples(sample_data(db_ps2)$Diet != "baseline", db_ps2)
+
+db_ps.prop <- transform_sample_counts(db_ps, function(x)x/sum(x))
+db_ps2.prop <- transform_sample_counts(db_ps2, function(x)x/sum(x))
+
+#set the function parameters, 0.15% abundance w/in a sample, and must have that criteria in at least 2 samples
+flist<- filterfun(kOverA(2, 0.0015))
+#Use function on your data:
+#this should be performed on your asv table transformed to proportional data
+db.logi <- filter_taxa(db_ps2.prop, flist) #create a list of ASVs that meet flist criteria
+#Now filter out ASVs that do not meet the criteria kOverA i.e. dd2.logi list...
+db_ps3 = prune_taxa(db.logi, db_ps2)
+(sum(taxa_sums(db_ps3)))/(sum(taxa_sums(db_ps)))
+db_dataloss <- as.data.frame(sort(sample_sums(db_ps3),decreasing = T))
+
+db_amp3 <- amp_load(db_ps3)
+
+```
+
+read in the data for mothur and create phyloseq and ampviz objects
+
+```{r, warning=F, message=F}
+mb_share = ("final.opti_mcc.shared")
+mb_tax = ("final.opti_mcc.0.03.cons.taxonomy")
+sam_dat <- sample_data(db_ps)
+mb_otu <- import_mothur(mothur_shared_file = mb_share)
+mb_dat <- import_mothur(mothur_shared_file = mb_share, mothur_constaxonomy_file = mb_tax)
+#add "species" column to tax table
+mb_tax <- data.frame(tax_table(mb_dat))
+mb_tax$Species <- paste0(NA)
+mb_tax <- tax_table(as(mb_tax,"matrix"))
+taxa_names(mb_otu)
+taxa_names(mb_tax)
+mb_ps <- merge_phyloseq(sam_dat,mb_otu,mb_tax)
+mb_ps
+
+colnames(tax_table(mb_ps)) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus","Species")
+colnames(tax_table(mb_ps))
+
+mb_dna <- readDNAStringSet("mb.fa", format = "fasta", use.names = T, with.qualities = F)
+
+mb_ps <- merge_phyloseq(mb_ps, mb_dna)
+
+mb_ps
+
+# create the baseline (BD) dataset for mothur:
+mb_ps2 <- subset_taxa(mb_ps, Kingdom != c("Eukaryota","unknown ","unknown"))
+mb_ps2 <- subset_taxa(mb_ps2, Phylum != c("Cyanobacteria","unknown_unclassified"))
+mb_ps2 <- subset_taxa(mb_ps2, Family != c("unknown_unclassified"))
+mb_ps2 <- prune_samples(sample_data(mb_ps2)$Diet != "baseline", mb_ps2)
+mb_ps2.amp <- amp_load(mb_ps2)
+
+mb_ps.prop <- transform_sample_counts(mb_ps, function(x)x/sum(x))
+mb_ps2.prop <- transform_sample_counts(mb_ps2, function(x)x/sum(x))
+
+
+#set the function parameters, 0.15% abundance w/in a sample, and must have that criteria in at least 2 samples
+flist<- filterfun(kOverA(2, 0.0015))
+#Use function on your data:
+#this should be performed on your asv table transformed to proportional data
+mb.logi <- filter_taxa(mb_ps2.prop, flist) #create a list of ASVs that meet flist criteria
+#Now filter out ASVs that do not meet the criteria kOverA i.e. dd2.logi list...
+mb_ps3 = prune_taxa(mb.logi, mb_ps2)
+(sum(taxa_sums(mb_ps3)))/(sum(taxa_sums(mb_ps)))
+mb_dataloss <- as.data.frame(sort(sample_sums(mb_ps3),decreasing = T))
+mb_amp3 <- amp_load(mb_ps3)
+```
+
+usearch is up next:
+
+```{r, warning=F, message=F}
+uparse_otutab_raw <- as(read.delim("uparse_otutab_raw.txt", row.names = 1),"matrix")
+uparse_otutab_raw <- otu_table(uparse_otutab_raw, taxa_are_rows = T)
+uparse_otutab <- otu_table(uparse_otutab_raw)
+sam_dat <- sample_data(db_ps)
+taxtab <- as(read.csv("uparse_v138.taxonomy.csv", row.names=1),"matrix")
+taxtab <- tax_table(taxtab)
+
+uparse_ps <- phyloseq(uparse_otutab,sam_dat,taxtab)
+
+
+uparse_tree <- read.newick("uparse_msa.tre")
+uparse_dna <- readDNAStringSet("ub.fa", format = "fasta", use.names = T, with.qualities = F)
+
+
+# create the uparse BD dataset for usearch:
+uparse_ps2 <- subset_taxa(uparse_ps, Kingdom != c("Eukaryota","unknown ","unknown"))
+uparse_ps2 <- subset_taxa(uparse_ps2, Phylum != c("Cyanobacteria","unknown_unclassified"))
+uparse_ps2 <- subset_taxa(uparse_ps2, Family != c("unknown_unclassified"))
+uparse_ps2 <- prune_samples(sample_data(uparse_ps2)$Diet != "baseline", uparse_ps2)
+
+uparse_ps <- merge_phyloseq(uparse_ps,uparse_tree, uparse_dna)
+
+uparse_amp <- amp_load(uparse_ps)
+uparse_amp2 <- amp_load(uparse_ps2)
+
+uparse_ps.prop <- transform_sample_counts(uparse_ps, function(x)x/sum(x))
+uparse_ps2.prop <- transform_sample_counts(uparse_ps2, function(x)x/sum(x))
+
+flist<- filterfun(kOverA(2, 0.0015))
+uparse_logi <- filter_taxa(uparse_ps2.prop, flist)
+uparse_ps3 <- prune_taxa(uparse_logi, uparse_ps2)
+uparse_amp3 <- amp_load(uparse_ps3)
+```
+
+
+generate some rarefaction curves
+```{r, warning=F, message=F}
+
+uparse_ps2
+uparse_ps3
+
+mb_ps2
+mb_ps3
+
+db_ps2
+db_ps3
+
+dd2_bd_mat = as(otu_table(db_ps2),"matrix")
+dd2_mcb_mat= as(otu_table(db_ps3),"matrix")
+
+u_bd_mat= as(t(otu_table(uparse_ps2)),"matrix")
+u_mcb_mat= as(t(otu_table(uparse_ps3)),"matrix")
+
+m_bd_mat= as(t(otu_table(mb_ps2)),"matrix")
+m_mcb_mat= as(t(otu_table(mb_ps3)),"matrix")
+
+dd2_bd_rare <- rarecurve(dd2_bd_mat, step=50, cex=0.5, tidy = T)
+dd2_mcb_rare <- rarecurve(dd2_mcb_mat, step=50, cex=0.5, tidy = T)
+
+m_bd_rare <- rarecurve(m_bd_mat, step=50, cex=0.5, tidy = T)
+m_mcb_rare <- rarecurve(m_mcb_mat, step=50, cex=0.5, tidy = T)
+
+u_bd_rare <- rarecurve(u_bd_mat, step=50, cex=0.5, tidy = T)
+u_mcb_rare <- rarecurve(u_mcb_mat, step=50, cex=0.5, tidy = T)
+
+p1 <- ggline(dd2_bd_rare, x = "Sample", y = "Species", group = "Site")+
+  #theme(plot.title = element_text(hjust = 0.5),
+   #     text = element_text(size=10),
+    #    axis.text.x = element_text(size = 10),
+     #   axis.text.y = element_text(size = 10),
+      ## legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        #legend.direction = "vertical")+
+  labs(y=expression("Copies per 100"*mu*"L"*("x"*10^10)), x=expression("Time"))+
+  scale_color_manual(values = c("black"))
+p <- ggrare(db_ps2, step = 100, label = "sample_number", se = F) + theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "DADA2 Baseline Rarefaction")
+p
+p2 <- ggrare(db_ps3, step = 100, label = "sample_number", se = F)+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "DADA2 MCB Rarefaction")
+p2
+
+
+p3 <- ggrare(mb_ps2, step = 100, label = "sample_number", se = F) + theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Mothur Baseline Rarefaction")
+p3
+p4 <- ggrare(mb_ps3, step = 100, label = "sample_number", se = F)+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Mothur MCB Rarefaction")
+p4
+
+
+p5 <- ggrare(uparse_ps2, step = 100, label = "sample_number", se = F) + theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Uparse Baseline Rarefaction")
+p5
+p6 <- ggrare(uparse_ps3, step = 100, label = "sample_number", se = F)+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Uparse MCB Rarefaction")
+p6
+
+rare_panel <- ggarrange(p,p2,p3,p4,p5,p6, nrow = 3, ncol = 2 , labels = "AUTO")
+
+rare_panel 
+
+ggsave("rare_panel.tiff", rare_panel, device = "tiff", dpi = 350, width = 9, height = 7)
+```
+
+
+
+negative control import:
+```{r, warning=F, message=F}
+nc_mothur_share = ("nc_final.opti_mcc.shared")
+nc_tax = ("nc_final.opti_mcc.0.03.cons.taxonomy")
+nc_map = read.table('nc_map.txt',sep = "\t",header = T, row.names = 1)
+nc_map = sample_data(nc_map)
+
+nc_mothur_data <- import_mothur(mothur_shared_file = nc_mothur_share,
+  mothur_constaxonomy_file = nc_tax)
+sample_names(nc_mothur_data)
+sample_names(nc_map)
+nc_mothur_ps <- merge_phyloseq(nc_map,nc_mothur_data)
+#check to see if everything seems in order:
+
+
+colnames(tax_table(nc_mothur_ps)) <- c("Kingdom", "Phylum", "Class", 
+  "Order", "Family", "Genus")
+colnames(tax_table(nc_mothur_ps))
+nc_mothur_ps
+nc_mothur_amp <- amp_load(nc_mothur_ps)
+nc_mothur_amp
+
+
+nc_m_ps.prop <- transform_sample_counts(nc_mothur_ps, function(x)x/sum(x))
+
+library("genefilter")
+flist<- filterfun(kOverA(2, 0.0015))
+logi <- filter_taxa(nc_m_ps.prop, flist) 
+nc_m_ps.filt = prune_taxa(logi, nc_mothur_ps)
+sum(taxa_sums(nc_m_ps.filt))
+sum(taxa_sums(nc_mothur_ps))
+
+nc_m_amp.filt<- amp_load(nc_m_ps.filt)
+nc_m_amp.filt
+
+
+nc_uparse_otutab <- as(read.delim("usearch_otutab_raw.txt", row.names = 1),"matrix")
+nc_uparse_otutab <- otu_table(nc_uparse_otutab, taxa_are_rows = T)
+
+nc_uparse_taxtab <- as(read.csv("usearch_nc_tax.csv", row.names=1, header = T),"matrix")
+nc_uparse_taxtab <- tax_table(nc_uparse_taxtab)
+
+nc_uparse_ps <- phyloseq(nc_uparse_otutab,nc_map,nc_uparse_taxtab)
+nc_uparse_ps
+
+nc_uparse_amp <- amp_load(nc_uparse_ps)
+nc_uparse_amp
+sample_names(nc_uparse_otutab)
+
+nc_u_ps.prop <- transform_sample_counts(nc_uparse_ps, function(x)x/sum(x))
+
+flist<- filterfun(kOverA(2, 0.0015))
+logi <- filter_taxa(nc_u_ps.prop, flist) 
+nc_u_ps.filt = prune_taxa(logi, nc_uparse_ps)
+sum(taxa_sums(nc_u_ps.filt))
+sum(taxa_sums(nc_uparse_ps))
+
+nc_u_amp.filt<- amp_load(nc_u_ps.filt)
+nc_u_amp.filt
+
+nc_dada2_ps<- merge_phyloseq(nc_otu_tab,nc_tax_tab,nc_map)
+nc_dada2_ps
+nc_dada2_amp <- amp_load(nc_dada2_ps)
+nc_dada2_amp
+
+nc_d_ps.prop <- transform_sample_counts(nc_dada2_ps, function(x)x/sum(x))
+
+library("genefilter")
+flist<- filterfun(kOverA(2, 0.0015))
+logi <- filter_taxa(nc_d_ps.prop, flist) 
+nc_d_ps.filt = prune_taxa(logi, nc_dada2_ps)
+sum(taxa_sums(nc_d_ps.filt))
+sum(taxa_sums(nc_dada2_ps))
+
+nc_d_amp.filt<- amp_load(nc_d_ps.filt)
+
+s <- print(nc_d_amp.filt)
+write.table(nc_d_amp.filt,file = "nc_dada2_filt_summary.txt", sep = '\t')
+
+```
+### Mock community (PC) analysis
+```{r message=F, warning=F}
+pc_mothur_share = ("positive.trim.contigs.good.unique.good.filter.unique.precluster.pick.nr_v138.wang.pick.tx.shared")
+pc_mothur_tax = ("positive.trim.contigs.good.unique.good.filter.unique.precluster.pick.nr_v138.wang.pick.tx.1.cons.taxonomy")
+pc_mothur_tree = ("pc.phylip.tre")
+
+pc_mothur_data <- import_mothur(mothur_shared_file = pc_mothur_share,
+  mothur_constaxonomy_file = pc_mothur_tax, mothur_tree_file = pc_mothur_tree)
+mothur_reads_in <- sum(taxa_sums(pc_mothur_data))
+mothur_pc_ps <- merge_phyloseq(samdat,pc_mothur_data)
+#check to see if everything seems in order:
+mothur_pc_ps
+
+colnames(tax_table(mothur_pc_ps)) <- c("Kingdom", "Phylum", "Class", 
+  "Order", "Family", "Genus")
+colnames(tax_table(mothur_pc_ps))
+
+mothur_pc_dna <- readDNAStringSet("pc.fa", format = "fasta", use.names = T, with.qualities = F)
+head(mothur_pc_dna)
+mothur_pc_ps <- merge_phyloseq(mothur_pc_ps,mothur_pc_dna)
+mothur_pc_ps 
+
+mothur_rarecurve <- rarecurve(as(t(otu_table(mothur_pc_ps)),"matrix"), step = 50, xlab = "Read Depth", ylab = "Species", label = T)
+
+pc_mothur_tax <- data.frame(tax_table(mothur_pc_ps))
+pc_mothur_tax$Species = "NA"
+pc_mothur_tax <- tax_table(pc_mothur_tax)
+colnames(tax_table(pc_mothur_tax)) <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
+rank_names(pc_mothur_tax)
+mothur_pc_ps  <- merge_phyloseq(mothur_pc_ps,pc_mothur_tax)
+mothur_pc_amp<- phyloseq_to_ampvis2(mothur_pc_ps)
+mothur_pc_amp
+
+taxa_names(mothur_pc_ps) <- paste0("M_OTU", seq(ntaxa(mothur_pc_ps)))
+head(refseq(mothur_pc_ps))
+head(otu_table(mothur_pc_ps))
+
+sort(as(sample_sums(mothur_pc_ps), "matrix"), decreasing = T)
+```
+
+
+do the same thing for USEARCH:
+setup uparse phyloseq and ampvis object:
+```{r message=F, warning=F}
+uparse_otutab_raw <- as(read.delim("uparse_pipeline/pc/pc.otutab_raw.txt", row.names = 1),"matrix")
+uparse_otutab_raw <- otu_table(uparse_otutab_raw, taxa_are_rows = T)
+uparse_reads_in <- sum(taxa_sums(uparse_otutab_raw))
+
+uparse_otutab <- otu_table(uparse_otutab_raw)
+sam_dat <- sample_data(samdat)
+taxtab <- as(read.csv("uparse_pipeline/pc/pc.otus.nr_v138.wang.taxonomy.csv", row.names=1),"matrix")
+taxtab <- tax_table(taxtab[,1:7])
+sample_names(uparse_otutab) <- sample_names(sam_dat)
+
+uparse_pc_ps <- phyloseq(uparse_otutab,sam_dat,taxtab)
+
+#silly <- subset_taxa(uparse_pc_ps, refhit=="yes")
+#sum(taxa_sums(silly))/uparse_reads_in*100
+
+uparse_pc_tree <- read.newick("uparse_pipeline/pc/pc_uparse_msa.tre")
+uparse_pc_dna <- readDNAStringSet("uparse_pipeline/pc/pc.otus.fa", format = "fasta", use.names = T, with.qualities = F)
+
+uparse_pc_ps <- merge_phyloseq(uparse_pc_ps, uparse_pc_dna)
+uparse_pc_ps <- merge_phyloseq(uparse_pc_ps,uparse_pc_tree)
+
+taxa_names(uparse_pc_ps)
+taxa_names(uparse_pc_ps) <- paste0("U_OTU", seq(ntaxa(uparse_pc_ps)))
+head(refseq(uparse_pc_ps))
+head(otu_table(uparse_pc_ps))
+
+uparse_amp <- phyloseq_to_ampvis2(uparse_pc_ps)
+
+uparse_rarecurve <- rarecurve(as(t(otu_table(uparse_pc_ps)),"matrix"), step = 50, xlab = "Read Depth", ylab = "Species", label = T)
+
+taxtab_w_refhits <- as(read.csv("uparse_pipeline/pc/pc.otus.nr_v138.wang.taxonomy.csv", row.names=1),"matrix")
+```
+
+# look at prevalence
+
+taxa in dada2 processed positive controls:
+```{r echo=F, message=F, warning=F}
+#remove taxa with more than 1 reads:
+dada_pc_ps <- prune_taxa(taxa_sums(dada_pc_ps) > 1, dada_pc_ps)
+dada_pc_ps
+
+# Define phyla to filter
+filterPhyla = c("Mitochondria")
+# Filter entries with unidentified Phylum.
+dada_pc_ps = subset_taxa(dada_pc_ps, !Family %in% filterPhyla)
+dada_pc_ps = subset_taxa(dada_pc_ps, Phylum!= "Cyanobacteria")
+dada_pc_ps = subset_taxa(dada_pc_ps, Kingdom!= "Eukaryota")
+dada_pc_ps
+
+# Compute prevalence of each feature, store as data.frame
+prevdf= apply(X = otu_table(dada_pc_ps),
+               MARGIN = ifelse(taxa_are_rows(dada_pc_ps), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(dada_pc_ps),
+                    tax_table(dada_pc_ps))
+
+dada_pc_ps.prop <- transform_sample_counts(dada_pc_ps, function(x) x/sum(x))
+dada_pc_ps.log <- transform_sample_counts(dada_pc_ps, function(x) log(1+x))
+#prevdf = subset(prevdf, Phylum %in% get_taxa_unique(dada_pc_ps, "Phylum"))
+
+```
+do the same for mothur processed data
+```{r message=F, warning=F}
+#remove taxa with more than 1 reads:
+mothur_pc_ps <- prune_taxa(taxa_sums(mothur_pc_ps) > 1, mothur_pc_ps)
+mothur_pc_ps
+
+# Define phyla to filter
+filterPhyla = c("Mitochondria")
+# Filter entries with unidentified Phylum.
+mothur_pc_ps = subset_taxa(mothur_pc_ps, !Family %in% filterPhyla)
+mothur_pc_ps = subset_taxa(mothur_pc_ps, Phylum!="Cyanobacteria")
+mothur_pc_ps = subset_taxa(mothur_pc_ps, Kingdom!="Eukaryota")
+mothur_pc_ps
+
+# Compute prevalence of each feature, store as data.frame
+mothur_prevdf= apply(X = otu_table(mothur_pc_ps),
+               MARGIN = ifelse(taxa_are_rows(mothur_pc_ps), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+mothur_prevdf = data.frame(Prevalence = mothur_prevdf,
+                    TotalAbundance = taxa_sums(mothur_pc_ps),
+                    tax_table(mothur_pc_ps))
+
+#mothur_prevdf = subset(mothur_prevdf, Phylum %in% get_taxa_unique(mothur_pc_ps, "Phylum"))
+
+mothur_pc_ps.prop <- transform_sample_counts(mothur_pc_ps, function(x) x/sum(x))
+mothur_pc_ps.log <- transform_sample_counts(mothur_pc_ps, function(x) log(1+x))
+
+#mothur_pc_taxasums <- data.frame(sort(taxa_sums(mothur_pc_ps), decreasing = T))
+
+#merge prevalence data for both datasets: this was used to collect pertinant data for phylogenetic tree comparisons:
+
+```
+
+and again for USEARCH
+```{r echo=F, message=F, warning=F}
+#remove taxa with more than 1 reads:
+uparse_pc_ps <- prune_taxa(taxa_sums(uparse_pc_ps) > 1, uparse_pc_ps)
+uparse_pc_ps
+
+# Define phyla to filter
+filterPhyla = c("Mitochondria")
+# Filter entries with unidentified Phylum.
+uparse_pc_ps = subset_taxa(uparse_pc_ps, !Family %in% filterPhyla)
+uparse_pc_ps = subset_taxa(uparse_pc_ps, Phylum!= "Cyanobacteria")
+uparse_pc_ps = subset_taxa(uparse_pc_ps, Kingdom!= "Eukaryota")
+uparse_pc_ps
+
+# Compute prevalence of each feature, store as data.frame
+uparse_prevdf= apply(X = otu_table(uparse_pc_ps),
+               MARGIN = ifelse(taxa_are_rows(uparse_pc_ps), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+uparse_prevdf = data.frame(Prevalence = uparse_prevdf,
+                    TotalAbundance = taxa_sums(uparse_pc_ps),
+                    tax_table(uparse_pc_ps))
+
+
+#prevdf = subset(prevdf, Phylum %in% get_taxa_unique(uparse_pc_ps, "Phylum"))
+
+#prevdf_merged <- rbind(prevdf,mothur_prevdf,uparse_prevdf)
+#write.table(prevdf_merged, file = "total_prev_data.txt", sep = "\t", row.names = T, col.names = T)
+uparse_pc_ps.prop <- transform_sample_counts(uparse_pc_ps, function(x) x/sum(x))
+uparse_pc_ps.log <- transform_sample_counts(uparse_pc_ps, function(x) log(1+x))
+
+```
+
+make some meaningful insights into how PC data relates to reported references
+```{r, warning=F, message=F}
+#export fastas for to see what matches refs at >97%
+amp_export_fasta(mothur_pc_amp,filename = "mothur_amp_bd.fa", tax= F)
+amp_export_fasta(uparse_amp,filename = "uparse_amp_bd.fa", tax= F)
+amp_export_fasta(dada_ps_amp,filename = "dada_amp_bd.fa", tax= F)
+# Aligned to reference 16S V4 sequences and results exported as hitfiles.csv
+dada_refhits_tab <- read.table("asvhittab.csv", sep = ",", header = F)
+mothur_refhits_tab <- read.table("mothurhittab.csv", sep = ",", header = F)
+uparse_refhits_tab <- read.table("uparsehittab.csv",sep=",", header = F)
+#make vector lists of taxa that match ref to add to histogram tables:
+dada_refhits <- unique(dada_refhits_tab[,1])
+mothur_refhits <- unique(mothur_refhits_tab[,1])
+uparse_refhits <- unique(uparse_refhits_tab[,1])
+
+```
+#Histograms of read depths for mothur and dada2 
+```{r, warning=F, message=F}
+#set some colors for the yes and no ref hits:
+col <- c(Hit="#E64B35B2", `Non-Ref`="#3C5488B2")
+
+#23 taxa matched the reference fasta seqs:
+ASV_ref_matches <- dada_refhits
+
+#make it a dataframe:
+ASV_ref_matches <- data.frame(ASV_ref_matches)
+ASV_ref_matches$Ref_match <- "yes"
+colnames(ASV_ref_matches) <- c("ASV","Ref_match")
+row.names(ASV_ref_matches) <- ASV_ref_matches[,1]
+
+
+#17 taxa matched the reference fasta seqs:
+OTU_ref_matches <- mothur_refhits
+
+#make it a dataframe that we can link with the read abundance data
+OTU_ref_matches <- data.frame(OTU_ref_matches)
+OTU_ref_matches$Ref_match <- "yes"
+colnames(OTU_ref_matches) <- c("OTU","Ref_match")
+row.names(OTU_ref_matches) <- OTU_ref_matches[,1]
+
+#17 taxa matched the reference fasta seqs:
+uparse_ref_matches <- uparse_refhits
+
+#make it a dataframe that we can link with the read abundance data
+uparse_ref_matches <- data.frame(uparse_ref_matches)
+uparse_ref_matches$Ref_match <- "yes"
+colnames(uparse_ref_matches) <- c("uparse","Ref_match")
+row.names(uparse_ref_matches) <- uparse_ref_matches[,1]
+
+#for uparse processed data make a data frame with total read counts per OTU
+uparse_pc_taxsums_df <- data.frame(taxa_sums(otu_table(uparse_pc_ps)))
+class(uparse_pc_taxsums_df)
+
+#change column names to something manageable
+colnames(uparse_pc_taxsums_df) <- c("Reads")
+
+uparse_pc_taxsums_df[order(-uparse_pc_taxsums_df$Reads),]
+
+#for mothur processed data make a data frame with total read counts per OTU
+mothur_pc_taxsums_df <- data.frame(taxa_sums(otu_table(mothur_pc_ps)))
+class(mothur_pc_taxsums_df)
+
+#change column names to something manageable
+colnames(mothur_pc_taxsums_df) <- c("Reads")
+
+mothur_pc_taxsums_df[order(-mothur_pc_taxsums_df$Reads),]
+
+
+#for dada2 processed data make a data frame with total read counts per ASV
+dd2_pc_taxsums_df <- data.frame(taxa_sums(otu_table(dada_pc_ps)))
+class(dd2_pc_taxsums_df)
+
+#change colnames to something manageable 
+colnames(dd2_pc_taxsums_df) <- c("Reads")
+
+#make a dataframe that includes taxonomy information:
+mttab<- data.frame(tax_table(mothur_pc_ps))
+dttab<- data.frame(tax_table(dada_pc_ps))
+uttab<- data.frame(tax_table(uparse_pc_ps))
+
+mreads <- cbind(mothur_pc_taxsums_df,mttab)
+dreads <- cbind(dd2_pc_taxsums_df,dttab)
+ureads <- cbind(uparse_pc_taxsums_df,uttab)
+
+mnames <- rownames(mreads)
+dnames <- rownames(dreads)
+unames <- rownames(ureads)
+
+mreads <- cbind(mnames,mreads)
+dreads <- cbind(dnames,dreads)
+ureads <- cbind(unames,ureads)
+
+
+#create a refhit column for reads dataframes:
+dreads$refhit <- with(dreads, ifelse(dreads$dnames %in% dada_refhits, "Hit", "Non-Ref"))
+dreads$refhit# see if it works
+mreads$refhit <- with(mreads, ifelse(mreads$mnames %in% mothur_refhits, "Hit", "Non-Ref"))
+mreads$refhit# see if it works
+ureads$refhit <- with(ureads, ifelse(ureads$unames %in% uparse_refhits, "Hit", "Non-Ref"))
+ureads$refhit# see if it works
+
+theme_update(plot.title = element_text(hjust = 0.5))
+
+#reorder dataframe in ascending order and make geom_bar plot of read data with y-axis scaled to log(10):
+ddhist <- ggplot(dreads, aes(reorder(dnames, -`Reads`),`Reads`, fill = refhit)) + geom_col() + 
+  theme(axis.text = element_text(angle = 90, vjust = 0)) + 
+  theme(axis.text.x = element_text(size = 3))+
+  scale_y_continuous() + 
+  labs(title = "DADA2 \n Read Distribution", x = "", y = "Read Count") +
+  scale_fill_manual(values=col, name= "Reference Match")
+ddhist
+
+ggsave("dada2pc_bd_read_count_hist.pdf", height = 5, width = 10)
+
+mhist <- ggplot(mreads, aes(reorder(mnames, -Reads),Reads, fill=refhit)) + geom_col() + 
+  theme(axis.text = element_text(angle = 90, vjust = 0)) +
+  theme(axis.text.x = element_text(size = 3))+
+  scale_y_continuous() + 
+  labs(title = "Mothur \n Read Distribution", x = "", y = "Read Count") + scale_fill_manual(values=col, name= "Reference Match")
+
+mhist
+
+ggsave("mothurpc_bd_read_count_hist.pdf", height = 5, width = 10)
+
+uhist <- ggplot(ureads, aes(reorder(unames, -Reads),Reads, fill=refhit)) + geom_col() + 
+  theme(axis.text = element_text(angle = 90, vjust = 0)) +
+  theme(axis.text.x = element_text(size = 3))+
+  scale_y_continuous() + 
+  labs(title = "USEARCH \n Read Distribution", x = "Taxa", y = "Read Count") +
+  scale_fill_manual(values=col, name= "Reference Match")
+
+uhist
+
+ggsave("uparsepc_bd_read_count_hist.pdf", height = 5, width = 10)
+
+
+```
+
+
+We need to filter asvs/otus by abundance by sample:
+in order to do this we use a function K over A filter parameter in r with the genefilter package where A is the value you wish to exceed (i.e. prevalence threshold within sample), and K is the number of elements that have to exceed A (i.e. the number of samples needed to meet the value). so in our case we will use 0.015% abundance threshold, based on the proportion of "real" asvs/otus per sample in the mock samples
+
+```{r, warning=F, message=F}
+#try and filter dada2 ps by abundance of 0.15% within a sample:
+library("genefilter")
+flist<- filterfun(kOverA(2, 0.0015))
+dd2.logi <- filter_taxa(dada_pc_ps.prop, flist) 
+dd2.filt.ps = prune_taxa(dd2.logi, dada_pc_ps)
+taxa_sums(dd2.filt.ps)
+
+#transform to ampvis, then export fasta:
+dd2.filt.amp = phyloseq_to_ampvis2(dd2.filt.ps)
+amp_export_fasta(dd2.filt.amp, filename = "pc_dada2filt.fa", tax = F)
+
+#try and filter mothur ps by abundance of 0.15% within a sample:
+flist<- filterfun(kOverA(2, 0.0015))
+moth.logi <- filter_taxa(mothur_pc_ps.prop, flist) 
+moth.filt.ps = prune_taxa(moth.logi, mothur_pc_ps)
+taxa_sums(moth.filt.ps)
+
+#transform to ampvis, then export fasta:
+moth.filt.amp = phyloseq_to_ampvis2(moth.filt.ps)
+amp_export_fasta(moth.filt.amp, filename = "pc_mothurfilt.fa", tax = F)
+
+#try and filter uparse ps by abundance of 0.15% within a sample:
+flist<- filterfun(kOverA(2, 0.0015))
+uparse.logi <- filter_taxa(uparse_pc_ps.prop, flist) 
+uparse.filt.ps = prune_taxa(uparse.logi, uparse_pc_ps)
+taxa_sums(uparse.filt.ps)
+
+#transform to ampvis, then export fasta:
+uparse.filt.amp = phyloseq_to_ampvis2(uparse.filt.ps)
+amp_export_fasta(uparse.filt.amp, filename = "pc_uparsefilt.fa", tax = F)
+
+```
+
+```{r, warning=F, message=F}
+col <- c(Hit="#E64B35B2", `Non-Ref`="#3C5488B2")
+#make histogram:
+uparse_filt_taxsums_df <- data.frame(taxa_sums(otu_table(uparse.filt.ps)))
+class(uparse_filt_taxsums_df)
+
+#change column names to something manageable
+colnames(uparse_filt_taxsums_df) <- c("Reads")
+uparse_pc_filt_reads_retained <- sum(uparse_filt_taxsums_df$Reads)
+uparse_percent_retained <- (uparse_pc_filt_reads_retained/uparse_reads_in*100)
+uparse_taxa_left <- length(taxa_names(uparse.filt.ps))
+uparse_baseline_taxa <- length(taxa_names(uparse_pc_ps))
+
+#make a dataframe that includes taxonomy information:
+uttab_filt<- data.frame(tax_table(uparse.filt.ps))
+
+
+ureads_filt <- cbind(uparse_filt_taxsums_df,uttab_filt)
+
+
+unames_filt <- rownames(ureads_filt)
+
+
+ureads_filt <- cbind(unames_filt,ureads_filt)
+ureads_filt$refhit <- with(ureads_filt, ifelse(ureads_filt$unames_filt %in% uparse_refhits, "Hit", "Non-Ref"))
+
+uhist_filt <- ggplot(ureads_filt, aes(reorder(unames_filt, -Reads),Reads, fill = refhit)) + geom_col() + theme(axis.text = element_text(angle = 90, vjust = 0)) + scale_y_continuous() + labs(title = "USEARCH Filtered \n Read Distribution", x = "Taxa", y = "Read Count") + scale_fill_manual(values=col, name= "Reference Match")
+
+
+uhist_filt
+
+ggsave("filtered_uparse_read_count_hist.pdf")
+```
+
+```{r, warning=F, message=F}
+col <- c(Hit="#E64B35B2", `Non-Ref`="#3C5488B2")
+#make histogram:
+mothur_filt_taxsums_df <- data.frame(taxa_sums(otu_table(moth.filt.ps)))
+class(mothur_filt_taxsums_df)
+
+#change column names to something manageable
+colnames(mothur_filt_taxsums_df) <- c("Reads")
+mothur_pc_filt_reads_retained <- sum(mothur_filt_taxsums_df$Reads)
+mothur_percent_retained <- (mothur_pc_filt_reads_retained/mothur_reads_in*100)
+mothur_taxa_left <- length(taxa_names(moth.filt.ps))
+mothur_baseline_taxa <- length(taxa_names(mothur_pc_ps))
+
+#make a dataframe that includes taxonomy information:
+mttab_filt<- data.frame(tax_table(moth.filt.ps))
+
+
+mreads_filt <- cbind(mothur_filt_taxsums_df,mttab_filt)
+
+
+mnames_filt <- rownames(mreads_filt)
+
+
+mreads_filt <- cbind(mnames_filt,mreads_filt)
+mreads_filt$refhit <- with(mreads_filt, ifelse(mreads_filt$mnames_filt %in% mothur_refhits, "Hit", "Non-Ref"))
+
+mhist_filt <- ggplot(mreads_filt, aes(reorder(mnames_filt, -Reads),Reads, fill = refhit)) + geom_col() + theme(axis.text = element_text(angle = 90, vjust = 0)) + scale_y_continuous() + labs(title = "Mothur Filtered \n Read Distribution", x = "", y = "Read Count") + scale_fill_manual(values=col, name= "Reference Match")
+
+
+mhist_filt
+
+ggsave("filtered_mothur_read_count_hist.pdf")
+```
+
+```{r, warning=F, message=F}
+col <- c(Hit="#E64B35B2", `Non-Ref`="#3C5488B2")
+#make histogram:
+dada_filt_taxsums_df <- data.frame(taxa_sums(otu_table(dd2.filt.ps)))
+class(dada_filt_taxsums_df)
+
+#change column names to something manageable
+colnames(dada_filt_taxsums_df) <- c("Reads")
+dada_pc_filt_reads_retained <- sum(dada_filt_taxsums_df$Reads)
+dada_percent_retained <- (dada_pc_filt_reads_retained/dada_reads_in*100)
+dada_taxa_left <- length(taxa_names(dd2.filt.ps))
+dada_baseline_taxa <- length(taxa_names(dada_pc_ps))
+
+#make a dataframe that includes taxonomy information:
+dttab_filt<- data.frame(tax_table(dd2.filt.ps))
+
+
+dreads_filt <- cbind(dada_filt_taxsums_df,dttab_filt)
+
+
+dnames_filt <- rownames(dreads_filt)
+
+
+dreads_filt <- cbind(dnames_filt,dreads_filt)
+dreads_filt$refhit <- with(dreads_filt, ifelse(dreads_filt$dnames_filt %in% dada_refhits, "Hit", "Non-Ref"))
+
+dhist_filt <- ggplot(dreads_filt, aes(reorder(dnames_filt, -Reads),Reads, fill = refhit)) + geom_col() + theme(axis.text = element_text(angle = 90, vjust = 0)) + scale_y_continuous() + labs(title = "DADA2 Filtered \n Read Distribution", x = "", y = "Read Count") + scale_fill_manual(values=col, name= "Reference Match")
+
+
+dhist_filt
+
+ggsave("filtered_dada_read_count_hist.pdf")
+```
+make a table of what we started with and where we are at now after filtering.
+```{r, warning=F, message=F}
+
+pc_filt_df <- data.frame(c("Dada2", "Mothur", "USEARCH"),
+                         c(dada_reads_in,mothur_reads_in,uparse_reads_in),
+                         c(dada_pc_filt_reads_retained,mothur_pc_filt_reads_retained,uparse_pc_filt_reads_retained),
+                         c(dada_percent_retained,mothur_percent_retained,uparse_percent_retained),
+                         c(dada_baseline_taxa,mothur_baseline_taxa,uparse_baseline_taxa),
+                         c(dada_taxa_left,mothur_taxa_left,uparse_taxa_left))
+colnames(pc_filt_df) <- c("Method","Starting Read\nCount","Reads Post\nFiltration","Reads Retained (%)","Starting Taxa #", "Taxa Post\nFiltration")
+
+tab <- pc_filt_df %>% 
+  knitr::kable(
+    format = "latex",
+    align = "c",
+    booktabs = T,
+    linesep = "",
+    ) %>%
+  kableExtra::kable_styling(
+      position = "center",
+      latex_options = c("striped", "repeat_header","scale_down")
+    )
+
+save_kable(tab, file = "PC_filt_tab.pdf")
+```
+
+make filtration histogram stuff into one cohesive figure to visualize the table information:
+
+```{r, warning=F, message=F}
+#combine all the alpha boxplots
+p = list(mhist, mhist_filt, ddhist, dhist_filt, uhist, uhist_filt) %>% map(~.x + labs(x=NULL,y=NULL))
+
+#make labels for the combined plot
+yleft <- textGrob(expression(paste("Read Counts")), rot = 90, gp = gpar(fontsize = 20))
+
+bottom <- textGrob("Taxa ID (ASV or OTU)", gp = gpar(fontsize=20))
+
+pc_hist = arrangeGrob(grobs=p, ncol = 2, nrow = 3, left = yleft, bottom = bottom,)
+pc_hist
+
+
+hist_plot <- ggarrange(mhist,mhist_filt,
+                       ddhist,dhist_filt,
+                       uhist, uhist_filt,
+                       labels = "AUTO",
+                       nrow = 3, ncol = 2,
+                       common.legend = T, legend = "bottom",
+                       align = "hv"
+                       )
+ggsave(filename = "pc_total_hist.pdf", 
+       hist_plot, width = 14, height = 10)
+```
+
+
+```{r, warning=F, message=F}
+
+#import a tree in tidy format:
+
+tree <- read.newick(file = "pc_filt_msa.fa.treefile")
+filt.clustalO.tree <- as_tibble(tree)
+class(filt.clustalO.tree)
+tree <- as.phylo(tree)
+# How to print bootstrap support values with ggtree
+library(ape)
+library(ggtree)
+library(tibble)
+
+# Make a dataframe (tibble) with node IDs (integers) and their corresponding bootstrap support values
+# The tibble has two columns: one called "node", the other can be named as we like (here, "bootstrap")
+bs_tibble <- tibble(
+  # hard-code node ID: internal nodes start after tip nodes,
+  # and phy$node.label is in the same order as internal nodes
+  node=1:Nnode(tree) + Ntip(tree), 
+  # Don't print BS < 50%
+  # (or to show all BS, just do `bootstrap = phy$node.label`)
+  bootstrap = ifelse(tree$node.label < 50, "", tree$node.label))
+
+# Use the ggtree::`%<+%` operator to map the bootstrap values onto the ggtree object
+ggtree(tree) %<+% bs_tibble +
+  # now we can show BS values using geom_text()
+  geom_text(aes(label=bootstrap), hjust=-.25, size = 3) +
+  # add tip labels
+  geom_tiplab(aes(label=label))
+#load in the metadata of interest for the tree for all merged data:
+#unified vector of column names
+
+tree_colnames <- c("Names","Reads","Kingdom","Phylum","Class","Order","Family","Genus","Species","refhit")
+
+mtdf <- mreads_filt
+colnames(mtdf) <- tree_colnames
+mtdf$Method <- paste0("Mothur")
+
+dtdf <- dreads_filt
+colnames(dtdf) <- tree_colnames
+dtdf$Method <- paste0("DADA2")
+
+utdf <- ureads_filt
+colnames(utdf) <- tree_colnames
+utdf$Method <- paste0("USEARCH")
+
+refdf <- read.table("ref_metadat.txt", header = T, row.names = 1, sep = "\t")
+refdf <- data.frame(refdf)
+refdf[is.na(refdf)] <- 0
+#check if colnames are the samesies:
+ifelse(colnames(refdf)==colnames(utdf),T,F)
+
+treedat <- rbind(mtdf,dtdf,utdf,refdf) 
+
+colnames(treedat)[colnames(treedat) == "Names"] <- "label"
+
+
+b <- tibble(treedat)
+class(b)
+c <- full_join(tree,b,"label")
+class(c)
+
+
+df1 <- data.frame(treedat[,c("Reads")])
+rownames(df1) <- rownames(treedat)
+colnames(df1) <- "Total Reads"
+
+df3 <- data.frame(treedat[,c("Genus")])
+rownames(df3) <- rownames(treedat)
+colnames(df3) <- "Genus"
+
+df4 <- data.frame(treedat[,c("Method")])
+rownames(df4) <- rownames(treedat)
+colnames(df4) <- "Method"
+
+library(ggsci)
+library(scales)
+pal1 <- pal_nejm(alpha = 0.7)(4)
+show_col(pal1)
+ pal1 
+col <- c(DADA2="#BC3C29B2", Mothur="#0072B5B2", USEARCH="#20854EB2", Reference="#E18727B2")
+tree.p <- ggtree(c, layout="fan", open.angle=120, branch.length = "none")%<+% bs_tibble + 
+  geom_tippoint(aes(color=Method), size= 2) + 
+  geom_text(aes(label=bootstrap), hjust=-.25, size = 2) +
+  scale_color_manual(values=col)
+tree.p
+
+pal2 <- wes_palette("Zissou1", 100, type = "continuous")
+
+#t1 <- gheatmap(tree.p, df3, offset = .35, width = .1,
+         #colnames=F) +  scale_fill_manual(values = genus_colors , name="Genus") +
+         #geom_tiplab(aes(label=label), linetype="dotted", size=2, align = T, offset=.1) #+
+  #geom_hilight(node=67, fill="#543005", alpha=0.5) +
+  #geom_hilight(node=64, fill="#8C510A", alpha=0.5) +
+  #geom_hilight(node=70, fill="#BF812D", alpha=0.5) +
+  #geom_hilight(node=58, fill="#DFC27D", alpha=0.5) +
+  #geom_hilight(node=54, fill="#F6E8C3", alpha=0.5) +
+  #geom_hilight(node=72, fill="#C7EAE5", alpha=0.5) +
+  #geom_hilight(node=46, fill="#80CDC1", alpha=0.5) +
+  #geom_hilight(node=77, fill="#35978F", alpha=0.5) +
+  #geom_cladelabel(67, "L. monocytogenes", offset=350, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3) + 
+  #geom_cladelabel(64, "E. faecalis", offset=350, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3) +
+  #geom_cladelabel(70, "S. aureus", offset=350, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3) +
+  #geom_cladelabel(58, "L. fermentnum", offset=250, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3) +
+  #geom_cladelabel(54, "B. subtilis", offset=350, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3) +
+  #geom_cladelabel(72, "P. aeruginosa", offset=350, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3) + 
+  #geom_cladelabel(46, "E. coli", offset=350, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3) +
+  #geom_cladelabel(77, "S. enterica", offset=350, barsize=1.5, angle=90, offset.text=20, hjust=0.5, fontsize=3)
+#t1
+t2 <- tree.p + geom_tiplab(size=2, offset=.01) +
+  theme(legend.position = c(.6, .3),
+        legend.title = element_text(size=20), 
+        legend.text = element_text(size=18))
+
+#t2 <- t1 + ggnewscale::new_scale_fill()
+
+#t2 <- gheatmap(t2, df1, offset = 150, width =.05,  colnames = F) +
+      #scale_fill_gradientn(colours = pal2, name="Read Count")
+#t2
+
+ggsave("pc_filtered_clustalOW.tre_heat3.pdf",width = 12, height = 12)
+```
+Breakdown of Filtered Taxa Average Read Depths:
+
+```{r, warning=F, message=F}
+dd2.genus.ps <- tax_glom(dd2.filt.ps, taxrank = "Genus")
+moth.genus.ps <- tax_glom(moth.filt.ps, taxrank = "Genus")
+uparse.genus.ps <- tax_glom(uparse.filt.ps, taxrank = "Genus")
+
+
+dd2.gen.otu.df <- data.frame(t((otu_table(transform_sample_counts(dd2.genus.ps,function(x) x/sum(x))))))
+mothur.gen.otu.df <- data.frame(otu_table(transform_sample_counts(moth.genus.ps, function(x) x/sum(x))))
+uparse.gen.otu.df <- data.frame(otu_table(transform_sample_counts(uparse.genus.ps,function(x) x/sum(x))))
+
+dd2.gen.tax.df <- data.frame(tax_table(dd2.genus.ps))
+mothur.gen.tax.df <- data.frame(tax_table(moth.genus.ps))
+uparse.gen.tax.df <- data.frame(tax_table(uparse.genus.ps))
+
+dd2.genus <- cbind(dd2.gen.otu.df,dd2.gen.tax.df)
+mothur.genus <- cbind(mothur.gen.otu.df,mothur.gen.tax.df)
+uparse.genus <- cbind(uparse.gen.otu.df,uparse.gen.tax.df)
+
+l1 <- uparse.genus$Genus
+l2 <- mothur.genus$Genus
+l3 <-dd2.genus$Genus
+l4 <- c(l3,l2,l1)
+l5 <- unique(l4)
+simpsons <- pal_simpsons(palette = c("springfield"),alpha = .1)(14)
+#show_col(simpsons)
+#list the colors and match them with a genus
+genus_colors<- c(Pseudomonas = "#FED439B2",
+                 Salmonella = "#709AE1B2",
+                 `Escherichia/Shigella` = "#8A9197B2" ,
+                 Staphylococcus = "#D2AF81B2",
+                 Listeria =  "#FD7446B2" ,
+                 Enterococcus = "#D5E4A2B2",
+                 Bacillus = "#197EC0B2" ,
+                 Lactobacillus = "#F05C3BB2",
+                 Enterobacteriaceae_unclassified =  "#46732EB2",
+                 `Escherichia-Shigella` = "#71D0F5B2",
+                 Bacilli_unclassified = "#370335B2" ,
+                 Lactobacillales_unclassified = "#075149B2" ,
+                 Bacillaceae_unclassified = "#C80813B2" ,
+                 `Gammaproteobacteria_unclassified` = "#91331FB2" )
+
+#dada2 barplot
+dd2.genus$Mean <- rowMeans(dd2.genus[,1:10])
+dd2.genus$StdDev <- genefilter::rowSds(dd2.genus[,1:10])
+dd2.genus.bar <- ggplot(dd2.genus, mapping = aes(x=reorder(Genus,-Mean), y= Mean, fill = Genus))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = genus_colors, name = "Genus")+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+  geom_errorbar(aes(ymin=Mean-StdDev, ymax=Mean+StdDev), width=.2,
+                 position=position_dodge(0.05)) +
+  labs(Title= "DADA2", x ="DADA2 Filtered Taxa", y = "Proportion\nReads per Sample")
+
+#mothur bar
+mothur.genus$Mean <- rowMeans(mothur.genus[,1:10])
+mothur.genus$StdDev <- genefilter::rowSds(mothur.genus[,1:10])
+mothur.genus.bar <- ggplot(mothur.genus, mapping = aes(x=reorder(Genus,-Mean), y= Mean, fill = Genus))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = genus_colors, name = "Genus")+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+  geom_errorbar(aes(ymin=Mean-StdDev, ymax=Mean+StdDev), width=.2,
+                 position=position_dodge(0.05)) +
+  labs(Title= "Mothur", x ="Mothur Filtered Taxa", y = "Proportion\nReads per Sample")
+
+
+#usearch bar
+uparse.genus$Mean <- rowMeans(uparse.genus[,1:10])
+uparse.genus$StdDev <- genefilter::rowSds(uparse.genus[,1:10])
+uparse.genus.bar <- ggplot(uparse.genus, mapping = aes(x=reorder(Genus,-Mean), y= Mean, fill = Genus))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = genus_colors, name = "Genus")+
+  theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+
+  geom_errorbar(aes(ymin=Mean-StdDev, ymax=Mean+StdDev), width=.2,
+                 position=position_dodge(0.05)) +
+  labs(Title="USEARCH", x ="USEARCH Filtered Taxa", y = "Proportion\nReads per Sample")
+
+#make a list of the unique genera for a singular color scheme for the plots
+
+      
+  
+```
+
+
+Combine into one figure:
+```{r, warning=F, message=F}
+
+bartab <- ggarrange(t2,
+                    ggarrange(dd2.genus.bar,
+                              mothur.genus.bar,
+                              uparse.genus.bar, 
+                              labels = c("B","C","D"), 
+                              nrow = 3, ncol = 1,
+                              common.legend = T,
+                              legend = "right",
+                              hjust = 3),
+                    ncol = 2, widths = c(2,1.5),
+                    labels = "A")
+bplot <- ggarrange(dd2.genus.bar,
+                              mothur.genus.bar,
+                              uparse.genus.bar, 
+                              labels = c("A","B","C"), 
+                              nrow = 3, ncol = 1,
+                              common.legend = T,
+                              hjust = -0.5,
+                   legend = "right")
+hist <- ggarrange(ddhist,
+                  dhist_filt,
+                  mhist,
+                  mhist_filt,
+                  uhist,
+                  uhist_filt,
+                  labels = c("A","B","C","D","E","F"),
+                  common.legend = T,
+                  legend = "right",
+                  nrow = 3,
+                  ncol = 2)
+
+ggsave(filename = "test.pdf", plot = bartab, device = "pdf", width = 20, height = 16)
+ggsave(filename = "pc_fan_tree.pdf", plot = t2, device = "pdf", width= 12, height = 10)
+ggsave(filename = "pc_genus_abundance_barplot.pdf", plot = bplot, width= 10, height = 10)
+ggsave(filename = "pc_filt_histograms.pdf", plot = hist, width= 10, height = 10)
+
+
+
+
+```
+
+
+```{r, warning=F, message=F}
+library(ranacapa)
+
+p <- ggrare(uparse.filt.ps,step = 100, se = F, label = "Sample")+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Uparse MCB Rarefaction PC")
+p
+p2 <-ggrare(uparse_pc_ps,step = 100, se = F, label = "Sample") + theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Uparse Baseline Rarefaction PC")
+p2
+p3 <- ggrare(dd2.filt.ps,step = 100, se = F, label = "Sample")+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "DADA2 MCB Rarefaction PC")
+p3
+p4 <- ggrare(dada_pc_ps,step = 100, se = F, label = "Sample")+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "DADA2 Baseline Rarefaction PC")
+p4
+
+p5 <- ggrare(mothur_pc_ps,step = 100, se = F, label = "Sample")+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Mothur Baseline Rarefaction PC")
+p5
+p6 <- ggrare(moth.filt.ps,step = 100, se = F, label = "Sample")+ theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size=10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.background = element_rect(fill="white",size=0.5, linetype="solid", colour ="black"),
+        legend.direction = "vertical")+  
+  ggtitle(label = "Mothur MCB Rarefaction PC")
+p6
+
+pc_rare_panel <- ggarrange(p2,p,p4,p3,p5,p6, nrow = 3, ncol = 2 , labels = "AUTO")
+
+pc_rare_panel 
+
+ggsave("pc_rare_panel.tiff", pc_rare_panel, device = "tiff", dpi = 350, width = 9, height = 7)
+
+```
+
+### Comparative Analysis on the rumen microbiome data
+Prevalence only dada2: Rumen
+
+```{r, warning=F, message=F}
+# Define prevalence of each taxa
+# (in how many samples did each taxa appear at least once)
+prev0 = apply(X = otu_table(db_ps2),
+                MARGIN = ifelse(taxa_are_rows(db_ps2), yes = 1, no = 2),
+                FUN = function(x){sum(x > 0)})
+prevdf = data.frame(Prevalence = prev0,
+                      TotalAbundance = taxa_sums(db_ps2),
+                      tax_table(db_ps2))
+keepPhyla = table(prevdf$Phylum)[(table(prevdf$Phylum) > 5)]
+prevdf1 = subset(prevdf, Phylum %in% names(keepPhyla))
+# Define prevalence threshold as 5% of total samples
+#prevalenceThreshold = 0.03 * nsamples(mb_ps2)
+prevalenceThreshold = 2
+
+## [1] 18
+# Execute prevalence filter, using `prune_taxa()` function
+db_prev.ps = prune_taxa((prev0 >= prevalenceThreshold), db_ps2)
+db_prev.ps
+db_ps2
+```
+
+Prevalence only mothur: rumen
+```{r, warning=F, message=F}
+# Define prevalence of each taxa
+# (in how many samples did each taxa appear at least once)
+prev0 = apply(X = otu_table(mb_ps2),
+                MARGIN = ifelse(taxa_are_rows(mb_ps2), yes = 1, no = 2),
+                FUN = function(x){sum(x > 0)})
+prevdf = data.frame(Prevalence = prev0,
+                      TotalAbundance = taxa_sums(mb_ps2),
+                      tax_table(mb_ps2))
+keepPhyla = table(prevdf$Phylum)[(table(prevdf$Phylum) > 5)]
+prevdf1 = subset(prevdf, Phylum %in% names(keepPhyla))
+# Define prevalence threshold as 5% of total samples
+
+#prevalenceThreshold = 0.03 * nsamples(mb_ps2)
+prevalenceThreshold = 2
+
+## [1] 18
+# Execute prevalence filter, using `prune_taxa()` function
+mb_prev.ps = prune_taxa((prev0 >= prevalenceThreshold), mb_ps2)
+mb_prev.ps
+mb_ps2
+```
+
+Prevalence only usearch: rumen
+```{r, warning=F, message=F}
+# Define prevalence of each taxa
+# (in how many samples did each taxa appear at least once)
+prev0 = apply(X = otu_table(uparse_ps2),
+                MARGIN = ifelse(taxa_are_rows(uparse_ps2), yes = 1, no = 2),
+                FUN = function(x){sum(x > 0)})
+prevdf = data.frame(Prevalence = prev0,
+                      TotalAbundance = taxa_sums(uparse_ps2),
+                      tax_table(uparse_ps2))
+keepPhyla = table(prevdf$Phylum)[(table(prevdf$Phylum) > 5)]
+prevdf1 = subset(prevdf, Phylum %in% names(keepPhyla))
+# Define prevalence threshold as 5% of total samples
+#prevalenceThreshold = 0.03 * nsamples(mb_ps2)
+prevalenceThreshold = 2
+
+## [1] 18
+# Execute prevalence filter, using `prune_taxa()` function
+ub_prev.ps = prune_taxa((prev0 >= prevalenceThreshold), uparse_ps2)
+ub_prev.ps
+uparse_ps2
+
+```
+
+Prevalence only usearch: mock
+```{r, warning=F, message=F}
+# Define prevalence of each taxa
+# (in how many samples did each taxa appear at least once)
+prev0 = apply(X = otu_table(uparse_pc_ps),
+                MARGIN = ifelse(taxa_are_rows(uparse_pc_ps), yes = 1, no = 2),
+                FUN = function(x){sum(x > 0)})
+prevdf = data.frame(Prevalence = prev0,
+                      TotalAbundance = taxa_sums(uparse_pc_ps),
+                      tax_table(uparse_pc_ps))
+keepPhyla = table(prevdf$Phylum)[(table(prevdf$Phylum) > 5)]
+prevdf1 = subset(prevdf, Phylum %in% names(keepPhyla))
+# Define prevalence threshold as 5% of total samples
+#prevalenceThreshold = 0.03 * nsamples(mb_ps2)
+prevalenceThreshold = 2
+
+## [1] 18
+# Execute prevalence filter, using `prune_taxa()` function
+upc_prev.ps = prune_taxa((prev0 >= prevalenceThreshold), uparse_pc_ps)
+upc_prev.ps
+uparse_pc_ps
+
+
+```
+
+Prevalence only mothur: mock
+```{r, warning=F, message=F}
+# Define prevalence of each taxa
+# (in how many samples did each taxa appear at least once)
+prev0 = apply(X = otu_table(mothur_pc_ps),
+                MARGIN = ifelse(taxa_are_rows(mothur_pc_ps), yes = 1, no = 2),
+                FUN = function(x){sum(x > 0)})
+prevdf = data.frame(Prevalence = prev0,
+                      TotalAbundance = taxa_sums(mothur_pc_ps),
+                      tax_table(mothur_pc_ps))
+keepPhyla = table(prevdf$Phylum)[(table(prevdf$Phylum) > 5)]
+prevdf1 = subset(prevdf, Phylum %in% names(keepPhyla))
+# Define prevalence threshold as 5% of total samples
+#prevalenceThreshold = 0.03 * nsamples(mb_ps2)
+prevalenceThreshold = 2
+
+## [1] 18
+# Execute prevalence filter, using `prune_taxa()` function
+mpc_prev.ps = prune_taxa((prev0 >= prevalenceThreshold), mothur_pc_ps)
+mpc_prev.ps
+mothur_pc_ps
+
+
+```
+
+Prevalence only dada2: mock
+```{r, warning=F, message=F}
+# Define prevalence of each taxa
+# (in how many samples did each taxa appear at least once)
+prev0 = apply(X = otu_table(dada_pc_ps),
+                MARGIN = ifelse(taxa_are_rows(dada_pc_ps), yes = 1, no = 2),
+                FUN = function(x){sum(x > 0)})
+prevdf = data.frame(Prevalence = prev0,
+                      TotalAbundance = taxa_sums(dada_pc_ps),
+                      tax_table(dada_pc_ps))
+keepPhyla = table(prevdf$Phylum)[(table(prevdf$Phylum) > 5)]
+prevdf1 = subset(prevdf, Phylum %in% names(keepPhyla))
+# Define prevalence threshold as 5% of total samples
+#prevalenceThreshold = 0.03 * nsamples(mb_ps2)
+prevalenceThreshold = 2
+
+## [1] 18
+# Execute prevalence filter, using `prune_taxa()` function
+dpc_prev.ps = prune_taxa((prev0 >= prevalenceThreshold), dada_pc_ps)
+dpc_prev.ps
+dada_pc_ps
+
+
+```
+convert to ampviz object for alpha diversity calculations
+```{r, warning=F, message=F}
+#ampviz objects
+#baseline rumen
+db_ps2.amp <- amp_load(db_ps2)
+mb_ps2.amp <- amp_load(mb_ps2)
+ub_ps2.amp <- amp_load(uparse_ps2)
+
+#prevalence only rumen
+db_prev.amp <- amp_load(db_prev.ps)
+mb_prev.amp <- amp_load(mb_prev.ps)
+ub_prev.amp <- amp_load(ub_prev.ps)
+
+#MCB rumen
+db_mcb.amp <- amp_load(db_ps3)
+mb_mcb.amp <- amp_load(mb_ps3)
+ub_mcb.amp <- amp_load(uparse_ps3)
+
+#prevalence only mock
+dpc_prev.amp <- amp_load(dpc_prev.ps)
+mpc_prev.amp <- amp_load(mpc_prev.ps)
+upc_prev.amp <- amp_load(upc_prev.ps)
+
+#baseline mock
+dada_pc_amp <- amp_load(dada_pc_ps)
+uparse_pc_amp <- amp_load(uparse_pc_ps)
+mothur_pc_amp <- amp_load(mothur_pc_ps)
+
+#MCB mock
+dpc_mcb.amp <- amp_load(dd2.filt.ps)
+mpc_mcb.amp <- amp_load(moth.filt.ps)
+upc_mcb.amp <- amp_load(uparse.filt.ps)
+
+
+#mocks
+dada_pc_amp
+dpc_prev.amp
+dpc_mcb.amp
+
+mothur_pc_amp
+mpc_prev.amp
+mpc_mcb.amp
+
+uparse_pc_amp
+upc_prev.amp
+upc_mcb.amp
+
+#rumen
+db_ps2.amp
+db_prev.amp
+db_mcb.amp
+
+mb_ps2.amp
+mb_prev.amp
+mb_mcb.amp
+
+ub_ps2.amp
+ub_prev.amp
+ub_mcb.amp
+
+```
+
+dada2 alpha diversity
+```{r, warning=F,message=F}
+db_alpha <- amp_alphadiv(db_amp2)
+db_alpha.filt <- amp_alphadiv(db_amp3)
+
+db_diet_boxplot <- ggplot(data = db_alpha, 
+                          aes(x=Diet, y = ObservedOTUs, fill = Diet)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" )
+db_diet_boxplot
+
+db_diet_filt_boxplot <- ggplot(data = db_alpha.filt, 
+                          aes(x=Diet, y = ObservedOTUs, fill = Diet)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" )
+db_diet_filt_boxplot
+
+########################################################################################
+
+db_breed_boxplot <- ggplot(data = db_alpha, 
+                          aes(x=Breed, y = ObservedOTUs, fill = Breed)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" ) +
+  labs(title= "DADA2 Bacteria BD") +
+  theme(plot.title = element_text(hjust = 0.5))
+db_breed_boxplot
+
+db_breed_filt_boxplot <- ggplot(data = db_alpha.filt, 
+                          aes(x=Breed, y = ObservedOTUs, fill = Breed)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" ) + 
+  labs(title= "DADA2 Bacteria MCB-Filtered") +
+  theme(plot.title = element_text(hjust = 0.5))
+db_breed_filt_boxplot
+
+```
+
+Mothur alpha diversity
+```{r message=F, warning=F, echo = T}
+
+mb_alpha <- amp_alphadiv(mb_amp2)
+mb_alpha.filt <- amp_alphadiv(mb_amp3)
+
+mb_comparisons <- list( c("Calciumsulfate", "Corn_Oil"), c("Calciumsulfate", "RFDDGS"), c("Calciumsulfate", "Standard"),c("RFDDGS", "Corn_Oil"), c("Standard", "Corn_Oil"), c("Standard", "RFDDGS") )
+mb_diet_boxplot <- ggplot(data = mb_alpha, 
+                          aes(x=Breed, y = ObservedOTUs, fill = Diet)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" )
+mb_diet_boxplot
+
+mb_diet_filt_boxplot <- ggplot(data = mb_alpha.filt, 
+                          aes(x=Diet, y = ObservedOTUs, fill = Diet)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" )
+mb_diet_filt_boxplot
+
+mb_comparisons <- list( c("Calciumsulfate", "Corn_Oil"), c("Calciumsulfate", "RFDDGS"), c("Calciumsulfate", "Standard"),c("RFDDGS", "Corn_Oil"), c("Standard", "Corn_Oil"), c("Standard", "RFDDGS") )
+
+########################################################################################
+mb_breed_boxplot <- ggplot(data = mb_alpha, 
+                          aes(x=Breed, y = ObservedOTUs, fill = Breed)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" ) +
+  labs(title= "Mothur Bacteria BD") +
+  theme(plot.title = element_text(hjust = 0.5))
+mb_breed_boxplot
+
+mb_breed_filt_boxplot <- ggplot(data = mb_alpha.filt, 
+                          aes(x=Breed, y = ObservedOTUs, fill = Breed)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" ) +
+  labs(title= "Mothur Bacteria MCB-Filtered") +
+  theme(plot.title = element_text(hjust = 0.5))
+mb_breed_filt_boxplot
+```
+
+Usearch alpha and beta diversity
+```{r message=F, warning=F}
+#"normal" alpha-diversity
+uparse_amp2 <- phyloseq_to_ampvis2(uparse_ps2)
+
+uparse_alpha <- amp_alphadiv(uparse_amp)
+uparse_breed_boxplot <- ggplot(data = uparse_alpha, 
+                          aes(x=Breed, y = ObservedOTUs, fill = Breed)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "wilcox.test" ) + 
+  labs(title= "USEARCH Bacteria BD") +
+  theme(plot.title = element_text(hjust = 0.5))
+uparse_breed_boxplot
+
+#transform data for permanova
+uparse_ps_clr <- microbiome::transform(uparse_ps,transform = "clr")
+#normal permanova
+up_metadat <- data.frame(sample_data(uparse_ps))
+uparse_clr_permanova <- adonis2(phyloseq::distance(uparse_ps_clr, method="euclidean") ~ Breed + Square + Period:Square + Animal:Square +  Diet, data= up_metadat, permutation=999)
+uparse_clr_permanova
+
+#####################################################################################################
+#####################################################################################################
+#####################################################################################################
+
+
+uparse_ps3.prop <- transform_sample_counts(uparse_ps2, function(x) x/sum(x))
+flist<- filterfun(kOverA(2, 0.0015))
+uparse_logi <- filter_taxa(uparse_ps3.prop, flist)
+uparse_ps3 <- prune_taxa(uparse_logi, uparse_ps2)
+
+
+uparse_ps3
+uparse_amp3 <- phyloseq_to_ampvis2(uparse_ps3)
+
+uparse_alpha.filt <- amp_alphadiv(uparse_amp3)
+uparse_breed_filt_boxplot <- ggplot(data = uparse_alpha.filt, 
+                          aes(x=Breed, y = ObservedOTUs, fill = Breed)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pal3) +
+  stat_compare_means(method = "kruskal.test" ) + 
+  labs(title= "USEARCH Bacteria MCB-Filtered") +
+  theme(plot.title = element_text(hjust = 0.5))
+uparse_breed_filt_boxplot
+
+
+#transform counts for permanova
+uparse_clr_ps2 <- microbiome::transform(uparse_ps2, transform = 'clr')
+
+#filtered permanova
+up_metadat <- data.frame(sample_data(uparse_ps2))
+uparse2_clr_permanova <- adonis2(phyloseq::distance(uparse_clr_ps2, method="euclidean") ~ Breed + Square + Period:Square + Animal:Square +  Diet, data= up_metadat, permutation=999)
+uparse2_clr_permanova
+
+rank.names(uparse_ps3)
+uparse_clr_pca <- uparse_ps3 %>%
+  microViz::tax_fix(unknowns = c("uncultured")) %>%
+  microViz::tax_agg("Genus") %>%
+  microViz::tax_transform("clr") %>%
+  microViz::ord_calc(method = "PCA")
+
+uparse_clr_mcb_pca_ord <- ord_plot(data = uparse_clr_pca,
+                           color = "Breed",
+                           shape = "Diet",
+                           plot_taxa = 1:5,
+                           size = 2,
+                           tax_lab_style = tax_lab_style(type = "text", max_angle = 90, fontface = "bold.italic")) + 
+  scale_color_manual(values = pal3) + 
+  coord_fixed(ratio = 1, clip = "off", xlim = c(-6,3),ylim = c(-4,3))+
+  labs(title= "USEARCH MCB-Filtered Bacteria") +
+  theme(plot.title = element_text(hjust = 0.5))
+uparse_clr_mcb_pca_ord
+
+#####################################################################################################
+#####################################################################################################
+#####################################################################################################
+
+```
+
+Principal components for dada2 and mothur
+
+```{r message=F, warning=FALS}
+db_clr_mcb_pca <- db_ps3 %>%
+  tax_fix() %>%
+  tax_agg("Genus") %>%
+  tax_transform("clr") %>%
+  ord_calc(method = "PCA")
+db_clr_mcb_pca_ord <- ord_plot(data = db_clr_mcb_pca,
+                           color = "Breed",
+                           shape = "Diet",
+                           plot_taxa = 1:5,
+                           size = 2,
+                           tax_lab_style = tax_lab_style(type = "text", max_angle = 90, fontface = "bold.italic")) + 
+  scale_color_manual(values = pal3) + 
+  coord_fixed(ratio = 1, clip = "off", xlim = c(-6.5,3), ylim = c(-4,6))+
+  labs(title= "DADA2 MCB-Filtered Bacteria") +
+  theme(plot.title = element_text(hjust = 0.5))
+db_clr_mcb_pca_ord
+
+db_pca_plot <- ord_plot_iris(data = db_clr_mcb_pca, n_taxa = 12,
+              tax_level = "Genus",
+              bar_width = 1.8,
+              anno_colour = "Breed",
+              ) + 
+  scale_color_manual(values = pal3) +
+  theme(legend.position = "right") +
+  guides(fill = guide_legend(ncol = 1))
+db_pca_plot
+
+db_clr_pca_tax_plot <- cowplot::plot_grid(db_clr_mcb_pca_ord,db_pca_plot, axis = "b", align = "h", nrow = 1, rel_widths = 5:4, labels = c("A","B"))
+
+
+##ggsave(db_clr_pca_tax_plot, filename = "pca_test.pdf", width = 15, height = 8)
+
+
+mb_clr_mcb_pca <- mb_ps3 %>%
+  tax_fix(unknowns = c("uncultured", "uncultured_ge")) %>%
+  tax_agg("Genus") %>%
+  tax_transform("clr") %>%
+  ord_calc(method = "PCA")
+mb_clr_mcb_pca_ord <- ord_plot(data = mb_clr_mcb_pca,
+                           color = "Breed",
+                           shape = "Diet",
+                           plot_taxa = 1:5,
+                           size = 2,
+                           tax_lab_style = tax_lab_style(type = "text", max_angle = 90, fontface = "bold.italic")) + 
+  scale_color_manual(values = pal3) + 
+  coord_fixed(ratio = 1, clip = "off", xlim = c(-6,3), ylim = c(-3,4.5))+
+  labs(title= "Mothur MCB-Filtered Bacteria") +
+  theme(plot.title = element_text(hjust = 0.5))
+mb_clr_mcb_pca_ord
+
+mb_pca_plot <- ord_plot_iris(data = mb_clr_mcb_pca, n_taxa = 12,
+              tax_level = "Genus",
+              bar_width = 1.8,
+              anno_colour = "Breed",
+              ) + 
+  scale_color_manual(values = pal3) +
+  theme(legend.position = "right") +
+  guides(fill = guide_legend(ncol = 1))
+mb_pca_plot
+```
+
+make some figures of what alpha boxplots and PCA biplots:
+```{r warning=F, message=F}
+b_clr_pca_plot <- ggarrange(db_clr_mcb_pca_ord,
+                              mb_clr_mcb_pca_ord,
+                              uparse_clr_mcb_pca_ord,
+                               widths = 6,
+                               heights = 6,
+                               nrow = 2,
+                            ncol = 2,
+                            common.legend = T,
+                            legend = "right",
+                            labels = "AUTO")
+b_clr_pca_plot
+#ggsave(b_clr_pca_plot, filename = "clr_pca_b.pdf", width = 10, height = 10)
+
+b_ObservedOTUs_alpha_boxplot <- ggarrange(db_breed_boxplot,
+                                     mb_breed_boxplot,
+                                     uparse_breed_boxplot,
+                                     db_breed_filt_boxplot,
+                                     mb_breed_filt_boxplot,
+                                     uparse_breed_filt_boxplot,
+                                     widths = 4,
+                                     heights = 4, 
+                                     nrow = 2,
+                                     ncol = 3,
+                                     common.legend = T,
+                                     legend = "right",
+                                     labels = "AUTO")
+
+b_ObservedOTUs_alpha_boxplot
+#ggsave(b_ObservedOTUs_alpha_boxplot, filename = "ObservedOTUs_boxplots_b.pdf", width = 11, height = 10)
+
+```
+
+Permanovas to look at the experimental model:
+```{r message=F, warning=F, echo = T}
+set.seed(1234)
+mb_clruf <- microbiome::transform(mb_ps2,'clr')
+db_clruf <- microbiome::transform(db_ps2,'clr')
+mb_clr <- microbiome::transform(mb_ps3,'clr')
+db_clr <- microbiome::transform(db_ps3,'clr')
+
+metadat <- data.frame(sample_data(db_clruf))
+
+mb_clruf_permanova <- adonis2(phyloseq::distance(mb_clruf, method="euclidean") ~ Breed + Square + Period:Square + Animal:Square +  Diet, data= metadat, permutation=999)
+mb_clruf_permanova
+
+db_clruf_permanova <- adonis2(phyloseq::distance(db_clruf, method="euclidean") ~ Breed + Square + Period:Square + Animal:Square +  Diet, data= metadat, permutation=999)
+db_clruf_permanova
+metadat <- data.frame(sample_data(db_clr))
+
+mb_clr_permanova <- adonis2(phyloseq::distance(mb_clr, method="euclidean") ~ Breed + Square + Period:Square + Animal:Square +  Diet, data= metadat, permutation=999)
+mb_clr_permanova
+
+db_clr_permanova <- adonis2(phyloseq::distance(db_clr, method="euclidean") ~ Breed + Square + Period:Square + Animal:Square +  Diet, data= metadat, permutation=999)
+db_clr_permanova
+
+##PERMANOVA COMPARISONS
+###################################################################################################################
+library(plyr)
+db_clruf_permanova$rn <- rownames(db_clruf_permanova)
+mb_clruf_permanova$rn <- rownames(mb_clruf_permanova)
+uparse_clr_permanova$rn <- rownames(uparse_clr_permanova)
+
+
+df <- join_all(list(db_clruf_permanova,mb_clruf_permanova,uparse_clr_permanova), by = 'rn', type = 'left')
+rownames(df) <- df$rn
+df$rn <- NULL
+
+b_clr_DB_permanova_tab<- df
+
+db_clr_permanova$rn <- rownames(db_clr_permanova)
+mb_clr_permanova$rn <- rownames(mb_clr_permanova)
+uparse2_clr_permanova$rn <- rownames(uparse2_clr_permanova)
+
+
+df <- join_all(list(db_clr_permanova,mb_clr_permanova,uparse2_clr_permanova), by = 'rn', type = 'left')
+rownames(df) <- df$rn
+df$rn <- NULL
+b_clr_MCF_permanova <- df
+b_clr_BDMCF_permanova_tab <- rbind(b_clr_DB_permanova_tab, b_clr_MCF_permanova)
+rownames(b_clr_BDMCF_permanova_tab) <- c("BD Breed","BD Square", "BD Diet","BD Square:Period","BD Square:Animal","BD Residual","BD Total","MCF Breed","MCF Square", "MCF Diet","MCF Square:Period","MCF Square:Animal","MCF Residual","MCF Total")
+
+sig1 <- c("***", "*", "*","NS", "***", "-", "-","***", "***", "**","*" ,"***", "-", "-")
+sig2 <- c("***", "**", "**","*", "***", "-", "-","***", "***", "**","**" ,"***", "-", "-")
+sig3 <- c("***", "**", "**","*", "***", "-", "-","***", "***", "**","*" ,"***", "-", "-")
+
+b_clr_BDMCF_permanova_tab$sig <- sig1
+b_clr_BDMCF_permanova_tab$sig.1 <- sig2
+b_clr_BDMCF_permanova_tab$sig.2 <- sig3
+b_clr_BDMCF_permanova_tab[,c(1,2,3,4,5,16,6,7,8,9,10,17,11,12,13,14,15,18)]
+
+testtab <- kbl(b_clr_BDMCF_permanova_tab[,c(1,2,3,4,5,16,6,7,8,9,10,17,11,12,13,14,15,18)], format = "latex", booktabs = T) %>%
+add_header_above(c(" ", "DADA2" = 6, "Mothur" = 6, "USEARCH" = 6)) %>%
+kable_styling(latex_options = c("striped", "scale_down")) %>%
+pack_rows("Baseline Data", 1, 7) %>%
+pack_rows("Mock Community Based Filtration", 8, 14)
+
+save_kable(testtab, file = "permanova_comparisons.pdf")
+###################################################################################################################
+##PCA COMPARISON PANELS
+###################################################################################################################
+uparse_clr_bd_pca <- uparse_ps2 %>%
+  microViz::tax_fix(unknowns = c("uncultured", "uncultured Family","uncultured_ge", "Incertae_Sedis")) %>%
+  microViz::tax_agg("Genus") %>%
+  microViz::tax_transform("clr") %>%
+  microViz::ord_calc(method = "PCA")
+
+uparse_clr_bd_pca_ord <- ord_plot(data = uparse_clr_bd_pca,
+                           color = "Breed",
+                           shape = "Diet",
+                           plot_taxa = 1:5,
+                           size = 2,
+                           tax_lab_style = tax_lab_style(type = "text", max_angle = 90, fontface = "bold.italic")) + 
+  scale_color_manual(values = pal3) + 
+  coord_fixed(ratio = 1, clip = "off", xlim = c(-4,8.5),ylim = c(-4,6))+
+  labs(title= "USEARCH BD Bacteria") +
+  theme(plot.title = element_text(hjust = 0.5))
+uparse_clr_bd_pca_ord
+
+mothur_clr_bd_pca <- mb_ps2 %>%
+  microViz::tax_fix(unknowns = c("uncultured", "uncultured Family","uncultured_ge", "Incertae_Sedis")) %>%
+  microViz::tax_agg("Genus") %>%
+  microViz::tax_transform("clr") %>%
+  microViz::ord_calc(method = "PCA")
+
+mothur_clr_bd_pca_ord <- ord_plot(data = mothur_clr_bd_pca,
+                           color = "Breed",
+                           shape = "Diet",
+                           plot_taxa = 1:5,
+                           size = 2,
+                           tax_lab_style = tax_lab_style(type = "text", max_angle = 90, fontface = "bold.italic")) + 
+  scale_color_manual(values = pal3) + 
+  coord_fixed(ratio = 1, clip = "off", xlim = c(-4,8.5),ylim = c(-5,4.5))+
+  labs(title= "Mothur BD Bacteria") +
+  theme(plot.title = element_text(hjust = 0.5))
+mothur_clr_bd_pca_ord
+
+dada2_clr_bd_pca <- db_ps2 %>%
+  microViz::tax_fix(unknowns = c("uncultured", "uncultured Family","uncultured_ge", "Incertae_Sedis")) %>%
+  microViz::tax_agg("Genus") %>%
+  microViz::tax_transform("clr") %>%
+  microViz::ord_calc(method = "PCA")
+
+dada2_clr_bd_pca_ord <- ord_plot(data = dada2_clr_bd_pca,
+                           color = "Breed",
+                           shape = "Diet",
+                           plot_taxa = 1:5,
+                           size = 2,
+                           tax_lab_style = tax_lab_style(type = "text", max_angle = 90, fontface = "bold.italic")) + 
+  scale_color_manual(values = pal3) + 
+  coord_fixed(ratio = 1, clip = "off", xlim = c(-6,7),ylim = c(-5.5,4.5))+
+  labs(title= "DADA2 BD Bacteria") +
+  theme(plot.title = element_text(hjust = 0.5))
+dada2_clr_bd_pca_ord
+
+b_clr_pca_plots <- ggarrange(dada2_clr_bd_pca_ord,
+                                     mothur_clr_bd_pca_ord,
+                                     uparse_clr_bd_pca_ord,
+                                     db_clr_mcb_pca_ord,
+                                     mb_clr_mcb_pca_ord,
+                                     uparse_clr_mcb_pca_ord,
+                                     align = 'hv',
+                                     nrow = 2,
+                                     ncol = 3,
+                                     common.legend = T,
+                                     legend = "bottom",
+                                     labels = "AUTO")
+
+b_clr_pca_plots
+ggsave(b_clr_pca_plots, filename = "b_clr_pca_plots.pdf", width = 14, height = 11)
+
+
+###################################################################################################################
+##Genus level taxonomy comparisons
+###################################################################################################################
+dada2_bd_genus_ps <- tax_glom(db_ps2, taxrank = "Genus", NArm = F)
+mothur_bd_genus_ps <- tax_glom(mb_ps2, taxrank = "Genus", NArm = F)
+uparse_bd_genus_ps <- tax_glom(uparse_ps2, taxrank = "Genus", NArm = F)
+
+dada2_mcb_genus_ps <- tax_glom(db_ps3, taxrank = "Genus", NArm = F)
+mothur_mcb_genus_ps <- tax_glom(mb_ps3, taxrank = "Genus", NArm = F)
+uparse_mcb_genus_ps <- tax_glom(uparse_ps3, taxrank = "Genus", NArm = F)
+
+write.table(data.frame(t(otu_table(dada2_bd_genus_ps))), file = "dada2_bd_genus_otutab.tsv", sep = "\t")
+write.table(data.frame(otu_table(mothur_bd_genus_ps)), file = "mothur_bd_genus_otutab.tsv", sep = "\t")
+write.table(data.frame(otu_table(uparse_bd_genus_ps)), file = "uparse_bd_genus_otutab.tsv", sep = "\t")
+
+write.table(data.frame(t(otu_table(dada2_mcb_genus_ps))), file = "dada2_mcb_genus_otutab.tsv", sep = "\t")
+write.table(data.frame(otu_table(mothur_mcb_genus_ps)), file = "mothur_mcb_genus_otutab.tsv", sep = "\t")
+write.table(data.frame(otu_table(uparse_mcb_genus_ps)), file = "uparse_mcb_genus_otutab.tsv", sep = "\t")
+
+write.table(data.frame(tax_table(dada2_bd_genus_ps)), file = "dada2_bd_genus_taxtab.tsv", sep = "\t")
+write.table(data.frame(tax_table(mothur_bd_genus_ps)), file = "mothur_bd_genus_taxtab.tsv", sep = "\t")
+write.table(data.frame(tax_table(uparse_bd_genus_ps)), file = "uparse_bd_genus_taxtab.tsv", sep = "\t")
+
+write.table(data.frame(tax_table(dada2_mcb_genus_ps)), file = "dada2_mcb_genus_taxtab.tsv", sep = "\t")
+write.table(data.frame(tax_table(mothur_mcb_genus_ps)), file = "mothur_mcb_genus_taxtab.tsv", sep = "\t")
+write.table(data.frame(tax_table(uparse_mcb_genus_ps)), file = "uparse_mcb_genus_taxtab.tsv", sep = "\t")
+
+#merged these tax and otu tables in excel to manually curate taxonomy info at the genus level.and replace any
+#unclassified genera with next highest level taxonomy...did this manually and it took forever...
+
+#devtools::install_github("gaospecial/ggVennDiagram")
+#devtools::install_github("yanlinlin82/ggvenn")
+library(ggvenn)
+library(ggVennDiagram)
+mcb_taxonomy4venn <- read.delim("asv_otu_7.7.22/mcb_tax4ven.txt")
+
+dd2mcb <- mcb_taxonomy4venn[1:79,2]
+mothmcb <- mcb_taxonomy4venn[1:75,3]
+usearchmcb <- mcb_taxonomy4venn[1:77,1]
+
+x <- list("DADA2 MCB Taxonomy" = dd2mcb, "Mothur MCB Taxonomy" = mothmcb, "USEARCH MCB Taxonomy"=usearchmcb)
+ggVennDiagram(x)
+
+bd_taxonomy4venn <- read.delim("asv_otu_7.7.22/tax4ven.txt")
+dd2bd <- bd_taxonomy4venn[1:274,3]
+mothbd <- bd_taxonomy4venn[1:611,1]
+usearchbd <- bd_taxonomy4venn[1:351,2]
+
+y <- list("DADA2 BD Taxonomy" = dd2bd, "Mothur BD Taxonomy" = mothbd, "USEARCH BD Taxonomy"=usearchbd)
+ggVennDiagram(y)
+
+mcb_venn <- ggvenn(
+  x, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF"),
+  stroke_size = 0.5, set_name_size = 4
+  ) +
+  labs(title = "Mock Community Based Filtration\nShared Genera") +
+  theme(plot.title = element_text(hjust = 0.5))
+  
+dbvenn <- ggvenn(
+  y, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF"),
+  stroke_size = 0.5, set_name_size = 4
+  ) + 
+  labs(title = "Basline Shared Genera") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+venn_plot <- ggarrange(dbvenn,
+                       mcb_venn,
+                       align = 'hv',
+                       nrow = 1,
+                       ncol = 2,
+                       labels = "AUTO")
+venn_plot
+ggsave(venn_plot, filename = "venn_plots.pdf", width = 12, height = 6)  
+
+top_abund_profiles <- read.delim("asv_otu_7.7.22/new_top_abund_profiles.txt", row.names=1)
+colnames(top_abund_profiles) <- c("Total Reads", "10 Most Abundant Genera", "20 Most Abundant Genera","30 Most Abundant Genera")
+
+toptaxtab <- kbl(top_abund_profiles, format = "latex", booktabs = T) %>%
+kable_styling(latex_options = c("striped", "scale_down")) %>%
+pack_rows("Baseline Data", 1, 3) %>%
+pack_rows("Mock Community Based Filtration", 4, 6)
+
+#save_kable(toptaxtab, file = "toptax_genera_comparisons.pdf")
+
+b <- amp_octave(db_amp)+
+  labs(title = "dada2 bacterial octave") +
+  theme(plot.title = element_text(hjust = 0.5))
+a <- amp_octave(da_amp)+
+  labs(title = "dada2 archaeal octave") +
+  theme(plot.title = element_text(hjust = 0.5))
+mb_oct <- amp_octave(mb_amp)+
+  labs(title = "Mothur bacterial octave") +
+  theme(plot.title = element_text(hjust = 0.5))
+ma_oct <- amp_octave(ma_amp)+
+  labs(title = "mothur archaeal octave") +
+  theme(plot.title = element_text(hjust = 0.5))
+ub_oct <- amp_octave(uparse_amp)+
+  labs(title = "usearch bacterial octave") +
+  theme(plot.title = element_text(hjust = 0.5))
+ua_oct <- amp_octave(arch.uparse_amp)+
+  labs(title = "usearch archaeal octave") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+#ggsave(b, filename = "dd2_bact_octave.pdf", width = 10, height = 14)
+#ggsave(a, filename = "dd2_arch_octave.pdf", width = 10, height = 14)
+#ggsave(mb_oct, filename = "mothur_bact_octave.pdf", width = 10, height = 14)
+#ggsave(ma_oct, filename = "mothur_arch_octave.pdf", width = 10, height = 14)
+#ggsave(ub_oct, filename = "usearch_bact_octave.pdf", width = 10, height = 14)
+#ggsave(ua_oct, filename = "usearch_arch_octave.pdf", width = 10, height = 14)
+
+###################################################################################################################
+##Differentially abundance taxa
+###################################################################################################################
+###Mothur BD
+mb_bd_dds = phyloseq_to_deseq2(mb_ps2, ~ Breed)
+geoMeans = apply(counts(mb_bd_dds), 1, gm_mean)
+mb_bd_dds = estimateSizeFactors(mb_bd_dds,geoMeans=geoMeans)
+mb_bd_dds = DESeq2::DESeq(mb_bd_dds, test = "Wald", fitType = "local")
+mb_bd_res = DESeq2::results(mb_bd_dds)
+alpha = 0.05
+sigtab = mb_bd_res[which(mb_bd_res$padj < alpha), ]
+#sigtab = res
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(mb_ps2)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+mb_bd_sigtab = sigtab
+mb_bd_deseq2_volcano <- plot_deseq(sigtab, alpha = 0.05) +
+  scale_color_manual(values = pal3)
+#mb_bd_deseq2_volcano
+#################################################################################################
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = pal3, ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(mb_bd_sigtab$log2FoldChange, mb_bd_sigtab$Phylum, function(x) max(x))
+x = sort(x, T)
+mb_bd_sigtab$Phylum = factor(as.character(mb_bd_sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(mb_bd_sigtab$log2FoldChange, mb_bd_sigtab$Genus, function(x) max(x))
+x = sort(x, T)
+mb_bd_sigtab$Genus = factor(as.character(mb_bd_sigtab$Genus), levels=names(x))
+mb_bd_deseq2_diffplot = ggplot(mb_bd_sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum, fill= Phylum)) +
+  geom_bar(stat = "identity") + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + 
+  scale_color_manual(values = dd.col) +
+  scale_fill_manual(values=dd.col)+
+  geom_hline(yintercept=0, linetype="dashed", color = "black", size=0.5)+
+  labs(title = "Mothur BD") +
+  theme(plot.title = element_text(hjust = 0.5))
+mb_bd_deseq2_diffplot
+##ggsave(mb_bd_deseq2_diffplot, filename = "mb_bd_deseq2_diffplot.pdf", width = 8, height = 8)
+
+###USEARCH BD
+ub_bd_dds = phyloseq_to_deseq2(uparse_ps2, ~ Breed)
+geoMeans = apply(counts(ub_bd_dds), 1, gm_mean)
+ub_bd_dds = estimateSizeFactors(ub_bd_dds,geoMeans=geoMeans)
+ub_bd_dds = DESeq2::DESeq(ub_bd_dds, test = "Wald", fitType = "local")
+ub_bd_res = DESeq2::results(ub_bd_dds)
+alpha = 0.05
+sigtab = ub_bd_res[which(ub_bd_res$padj < alpha), ]
+#sigtab = res
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(uparse_ps2)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+ub_bd_sigtab = sigtab
+ub_bd_deseq2_volcano <- plot_deseq(sigtab, alpha = 0.05) +
+  scale_color_manual(values = pal3)
+ub_bd_deseq2_volcano
+#################################################################################################
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = pal3, ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(ub_bd_sigtab$log2FoldChange, ub_bd_sigtab$Phylum, function(x) max(x))
+x = sort(x, T)
+ub_bd_sigtab$Phylum = factor(as.character(ub_bd_sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(ub_bd_sigtab$log2FoldChange, ub_bd_sigtab$Genus, function(x) max(x))
+x = sort(x, T)
+ub_bd_sigtab$Genus = factor(as.character(ub_bd_sigtab$Genus), levels=names(x))
+ub_bd_deseq2_diffplot = ggplot(ub_bd_sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum, fill= Phylum)) +
+  geom_bar(stat = "identity") + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + 
+  scale_color_manual(values = dd.col) +
+  scale_fill_manual(values=dd.col)+
+  geom_hline(yintercept=0, linetype="dashed", color = "black", size=0.5)+
+  labs(title = "USEARCH BD") +
+  theme(plot.title = element_text(hjust = 0.5))
+ub_bd_deseq2_diffplot
+##ggsave(ub_bd_deseq2_diffplot, filename = "ub_bd_deseq2_diffplot.pdf", width = 8, height = 8)
+
+###USEARCH MCB
+ub_mcb_dds = phyloseq_to_deseq2(uparse_ps3, ~ Breed)
+geoMeans = apply(counts(ub_mcb_dds), 1, gm_mean)
+ub_mcb_dds = estimateSizeFactors(ub_mcb_dds,geoMeans=geoMeans)
+ub_mcb_dds = DESeq2::DESeq(ub_mcb_dds, test = "Wald", fitType = "local")
+ub_mcb_res = DESeq2::results(ub_mcb_dds)
+alpha = 0.05
+sigtab = ub_mcb_res[which(ub_mcb_res$padj < alpha), ]
+#sigtab = res
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(uparse_ps3)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+ub_mcb_sigtab = sigtab
+ub_mcb_deseq2_volcano <- plot_deseq(sigtab, alpha = 0.05) +
+  scale_color_manual(values = pal3)
+ub_mcb_deseq2_volcano
+#################################################################################################
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = pal3, ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(ub_mcb_sigtab$log2FoldChange, ub_mcb_sigtab$Phylum, function(x) max(x))
+x = sort(x, T)
+ub_mcb_sigtab$Phylum = factor(as.character(ub_mcb_sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(ub_mcb_sigtab$log2FoldChange, ub_mcb_sigtab$Genus, function(x) max(x))
+x = sort(x, T)
+ub_mcb_sigtab$Genus = factor(as.character(ub_mcb_sigtab$Genus), levels=names(x))
+ub_mcb_deseq2_diffplot = ggplot(ub_mcb_sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum, fill= Phylum)) +
+  geom_bar(stat = "identity") + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + 
+  scale_color_manual(values = dd.col) +
+  scale_fill_manual(values=dd.col)+
+  geom_hline(yintercept=0, linetype="dashed", color = "black", size=0.5)+
+  labs(title = "USEARCH MCB") +
+  theme(plot.title = element_text(hjust = 0.5))
+ub_mcb_deseq2_diffplot
+##ggsave(ub_mcb_deseq2_diffplot, filename = "ub_mcb_deseq2_diffplot.pdf", width = 8, height = 8)
+
+###DADA2 BD
+db_bd_dds = phyloseq_to_deseq2(db_ps2, ~ Breed)
+geoMeans = apply(counts(db_bd_dds), 1, gm_mean)
+db_bd_dds = estimateSizeFactors(db_bd_dds,geoMeans=geoMeans)
+db_bd_dds = DESeq2::DESeq(db_bd_dds, test = "Wald", fitType = "local")
+db_bd_res = DESeq2::results(db_bd_dds)
+alpha = 0.05
+sigtab = db_bd_res[which(db_bd_res$padj < alpha), ]
+#sigtab = res
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(db_ps2)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+db_bd_sigtab = sigtab
+db_bd_deseq2_volcano <- plot_deseq(sigtab, alpha = 0.05) +
+  scale_color_manual(values = pal3)
+db_bd_deseq2_volcano
+#################################################################################################
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = pal3, ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(db_bd_sigtab$log2FoldChange, db_bd_sigtab$Phylum, function(x) max(x))
+x = sort(x, T)
+db_bd_sigtab$Phylum = factor(as.character(db_bd_sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(db_bd_sigtab$log2FoldChange, db_bd_sigtab$Genus, function(x) max(x))
+x = sort(x, T)
+db_bd_sigtab$Genus = factor(as.character(db_bd_sigtab$Genus), levels=names(x))
+db_bd_deseq2_diffplot = ggplot(db_bd_sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum, fill= Phylum)) +
+  geom_bar(stat = "identity") + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + 
+  scale_color_manual(values = dd.col) +
+  scale_fill_manual(values=dd.col)+
+  geom_hline(yintercept=0, linetype="dashed", color = "black", size=0.5) +
+  labs(title = "DADA2 BD") +
+  theme(plot.title = element_text(hjust = 0.5))
+db_bd_deseq2_diffplot
+##ggsave(db_bd_deseq2_diffplot, filename = "db_bd_deseq2_diffplot.pdf", width = 8, height = 8)
+
+#################################################################################################
+deseq2_diffplots <- ggarrange(db_bd_deseq2_diffplot,
+                              mb_bd_deseq2_diffplot,
+                              ub_bd_deseq2_diffplot,
+                              db_deseq2_diffplot,
+                              mb_deseq2_diffplot,
+                              ub_mcb_deseq2_diffplot, 
+               common.legend = T,
+               legend = "right",
+               ncol = 3, nrow = 2, labels = "AUTO") + scale_fill_manual(values = dd.col)
+#ggsave(deseq2_diffplots, filename = "total_deseq2.pdf", width = 30, height = 15)
+
+#################################################################################################
+##sigtabs
+
+write.table(mb_bd_sigtab, file = "mb_bd_sigtab.tsv", sep = "\t")
+write.table(mb_sigtab, file = "mb_mcb_sigtab.tsv", sep = "\t")
+write.table(db_bd_sigtab, file = "db_bd_sigtab.tsv", sep = "\t")
+write.table(db_sigtab, file = "db_mcb_sigtab.tsv", sep = "\t")
+write.table(ub_bd_sigtab, file = "ub_bd_sigtab.tsv", sep = "\t")
+write.table(ub_mcb_sigtab, file = "ub_mcb_sigtab.tsv", sep = "\t")
+mbd_tax <- ta
+write.table(data.frame(tax_table(mb_ps2)),file= "mbd_taxtab.tsv", sep="\t")
+write.table(data.frame(tax_table(mb_ps3)),file= "mmock_taxtab.tsv", sep="\t")
+
+write.table(data.frame(otu_table(mb_ps)),file= "mothur_otutab.tsv", sep="\t")
+mb_ps.prop <- transform_sample_counts(mb_ps, function(x)x/sum(x))
+write.table(data.frame(otu_table(mb_ps.prop)),file= "mothur_otutab_prop.tsv", sep="\t")
+
+```
+
+
+Diet differential abundace with deseq2:
+
+#### deseq2 diet dada2 bd:
+```{r warning=F, message=F}
+library("DESeq2")#;packageVersion('DESeq2')
+
+gm_mean = function(x, na.rm=T){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+db_bd_dds <- phyloseq_to_deseq2(db_ps2, ~Diet)
+db_bd_dds
+geoMeans <- apply(counts(db_bd_dds), 1, gm_mean)
+db_bd_dds = estimateSizeFactors(db_bd_dds,geoMeans=geoMeans)
+
+db_bd_dds = DESeq2::DESeq(db_bd_dds, test = "Wald", fitType = "local")
+
+db_bd_res = results(db_bd_dds)
+resultsNames(db_bd_dds)
+
+db_bd_res = db_bd_res[order(db_bd_res$padj, na.last=NA), ]
+alpha = 0.05
+db_bd_res1 = cbind(as(db_bd_res, "data.frame"), as(tax_table(db_ps2)[rownames(db_bd_res), ], "matrix"))
+db_bd_sigtab = db_bd_res[(db_bd_res$padj < alpha), ]
+db_bd_sigtab = cbind(as(db_bd_sigtab, "data.frame"), as(tax_table(db_ps2)[rownames(db_bd_sigtab), ], "matrix"))
+write.table(db_bd_sigtab, file = "db_bd_sigtab.tsv", sep = "\t")
+
+#Calciumsulfate Corn_Oil RFDDGS Standard
+
+#Standard vs Calciumsulfate
+standard_vs_CaSO4_resdf <- results(db_bd_dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+standard_vs_CaSO4_resdf <- standard_vs_CaSO4_resdf[which(standard_vs_CaSO4_resdf$padj < alpha), ]
+standard_vs_CaSO4_resdf<-cbind(as(standard_vs_CaSO4_resdf, "data.frame"), as(tax_table(db_ps2)[rownames(standard_vs_CaSO4_resdf), ], "matrix"))
+write.table(standard_vs_CaSO4_resdf[order(standard_vs_CaSO4_resdf$log2FoldChange, na.last = NA), ], file = "db_bd_sigtab.st.vs.caso4.tsv", sep = "\t")
+
+
+#Standard vs Corn_Oil
+standard_vs_cornoil_resdf<-results(db_bd_dds, contrast=c("Diet", "Standard", "Corn_Oil"))
+standard_vs_cornoil_resdf <- standard_vs_cornoil_resdf[which(standard_vs_cornoil_resdf$padj < alpha), ]
+standard_vs_cornoil_resdf<-cbind(as(standard_vs_cornoil_resdf, "data.frame"), as(tax_table(db_ps2)[rownames(standard_vs_cornoil_resdf), ], "matrix"))
+write.table(standard_vs_cornoil_resdf[order(standard_vs_cornoil_resdf$log2FoldChange, na.last = NA), ], file = "db_bd_sigtab.st.vs.coil.tsv", sep = "\t")
+
+#Standard vs RFDDGS
+standard_vs_rfddgs_resdf<-results(db_bd_dds, contrast=c("Diet", "Standard", "RFDDGS"))
+standard_vs_rfddgs_resdf <- standard_vs_rfddgs_resdf[which(standard_vs_rfddgs_resdf$padj < alpha), ]
+standard_vs_rfddgs_resdf<-cbind(as(standard_vs_rfddgs_resdf, "data.frame"), as(tax_table(db_ps2)[rownames(standard_vs_rfddgs_resdf), ], "matrix"))
+write.table(standard_vs_rfddgs_resdf[order(standard_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "db_bd_sigtab.st.vs.rfddgs.tsv", sep = "\t")
+
+
+#Calciumsulfate vs RFDDGS
+caso4_vs_rfddgs_resdf<-results(db_bd_dds, contrast=c("Diet", "Calciumsulfate", "RFDDGS"))
+caso4_vs_rfddgs_resdf <- caso4_vs_rfddgs_resdf[which(caso4_vs_rfddgs_resdf$padj < alpha), ]
+caso4_vs_rfddgs_resdf<-cbind(as(caso4_vs_rfddgs_resdf, "data.frame"), as(tax_table(db_ps2)[rownames(caso4_vs_rfddgs_resdf), ], "matrix"))
+write.table(caso4_vs_rfddgs_resdf[order(caso4_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "db_bd_sigtab.caso4.vs.rfddgs.tsv", sep = "\t")
+
+#Calciumsulfate vs Corn Oil
+caso4_vs_coil_resdf<-results(db_bd_dds, contrast=c("Diet", "Calciumsulfate", "Corn_Oil"))
+caso4_vs_coil_resdf <- caso4_vs_coil_resdf[which(caso4_vs_coil_resdf$padj < alpha), ]
+caso4_vs_coil_resdf<-cbind(as(caso4_vs_coil_resdf, "data.frame"), as(tax_table(db_ps2)[rownames(caso4_vs_coil_resdf), ], "matrix"))
+write.table(caso4_vs_coil_resdf[order(caso4_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "db_bd_sigtab.caso4.vs.coil.tsv", sep = "\t")
+
+#Corn Oil vs RFDDGS
+rfddgs_vs_coil_resdf<-results(db_bd_dds, contrast=c("Diet", "RFDDGS", "Corn_Oil"))
+rfddgs_vs_coil_resdf <- rfddgs_vs_coil_resdf[which(rfddgs_vs_coil_resdf$padj < alpha), ]
+rfddgs_vs_coil_resdf<-cbind(as(rfddgs_vs_coil_resdf, "data.frame"), as(tax_table(db_ps2)[rownames(rfddgs_vs_coil_resdf), ], "matrix"))
+write.table(rfddgs_vs_coil_resdf[order(rfddgs_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "db_bd_sigtab.rfddgs.vs.coil.tsv", sep = "\t")
+
+```
+#### deseq2 dada2 mcb diet:
+```{r warning=F, message=F}
+library("DESeq2")#;packageVersion('DESeq2')
+
+gm_mean = function(x, na.rm=T){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+db_mcb_dds <- phyloseq_to_deseq2(db_ps3, ~Diet)
+db_mcb_dds
+geoMeans <- apply(counts(db_mcb_dds), 1, gm_mean)
+db_mcb_dds = estimateSizeFactors(db_mcb_dds,geoMeans=geoMeans)
+
+db_mcb_dds = DESeq2::DESeq(db_mcb_dds, test = "Wald", fitType = "local")
+
+db_mcb_res = results(db_mcb_dds)
+resultsNames(db_mcb_dds)
+
+db_mcb_res = db_mcb_res[order(db_mcb_res$padj, na.last=NA), ]
+alpha = 0.05
+db_mcb_res1 = cbind(as(db_mcb_res, "data.frame"), as(tax_table(db_ps3)[rownames(db_mcb_res), ], "matrix"))
+db_mcb_sigtab = db_mcb_res[(db_mcb_res$padj < alpha), ]
+db_mcb_sigtab = cbind(as(db_mcb_sigtab, "data.frame"), as(tax_table(db_ps3)[rownames(db_mcb_sigtab), ], "matrix"))
+#write.table(db_mcb_sigtab, file = "db_mcb_sigtab.tsv", sep = "\t")
+
+#Calciumsulfate Corn_Oil RFDDGS Standard
+
+#Standard vs Calciumsulfate
+standard_vs_CaSO4_resdf <- results(db_mcb_dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+standard_vs_CaSO4_resdf <- standard_vs_CaSO4_resdf[which(standard_vs_CaSO4_resdf$padj < alpha), ]
+standard_vs_CaSO4_resdf<-cbind(as(standard_vs_CaSO4_resdf, "data.frame"), as(tax_table(db_ps3)[rownames(standard_vs_CaSO4_resdf), ], "matrix"))
+write.table(standard_vs_CaSO4_resdf[order(standard_vs_CaSO4_resdf$log2FoldChange, na.last = NA), ], file = "db_mcb_sigtab.st.vs.caso4.tsv", sep = "\t")
+
+
+#Standard vs Corn_Oil
+standard_vs_cornoil_resdf<-results(db_mcb_dds, contrast=c("Diet", "Standard", "Corn_Oil"))
+standard_vs_cornoil_resdf <- standard_vs_cornoil_resdf[which(standard_vs_cornoil_resdf$padj < alpha), ]
+standard_vs_cornoil_resdf<-cbind(as(standard_vs_cornoil_resdf, "data.frame"), as(tax_table(db_ps3)[rownames(standard_vs_cornoil_resdf), ], "matrix"))
+write.table(standard_vs_cornoil_resdf[order(standard_vs_cornoil_resdf$log2FoldChange, na.last = NA), ], file = "db_mcb_sigtab.st.vs.coil.tsv", sep = "\t")
+
+#Standard vs RFDDGS
+standard_vs_rfddgs_resdf<-results(db_mcb_dds, contrast=c("Diet", "Standard", "RFDDGS"))
+standard_vs_rfddgs_resdf <- standard_vs_rfddgs_resdf[which(standard_vs_rfddgs_resdf$padj < alpha), ]
+standard_vs_rfddgs_resdf<-cbind(as(standard_vs_rfddgs_resdf, "data.frame"), as(tax_table(db_ps3)[rownames(standard_vs_rfddgs_resdf), ], "matrix"))
+write.table(standard_vs_rfddgs_resdf[order(standard_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "db_mcb_sigtab.st.vs.rfddgs.tsv", sep = "\t")
+
+
+#Calciumsulfate vs RFDDGS
+caso4_vs_rfddgs_resdf<-results(db_mcb_dds, contrast=c("Diet", "Calciumsulfate", "RFDDGS"))
+caso4_vs_rfddgs_resdf <- caso4_vs_rfddgs_resdf[which(caso4_vs_rfddgs_resdf$padj < alpha), ]
+caso4_vs_rfddgs_resdf<-cbind(as(caso4_vs_rfddgs_resdf, "data.frame"), as(tax_table(db_ps3)[rownames(caso4_vs_rfddgs_resdf), ], "matrix"))
+write.table(caso4_vs_rfddgs_resdf[order(caso4_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "db_mcb_sigtab.caso4.vs.rfddgs.tsv", sep = "\t")
+
+#Calciumsulfate vs Corn Oil
+caso4_vs_coil_resdf<-results(db_mcb_dds, contrast=c("Diet", "Calciumsulfate", "Corn_Oil"))
+caso4_vs_coil_resdf <- caso4_vs_coil_resdf[which(caso4_vs_coil_resdf$padj < alpha), ]
+caso4_vs_coil_resdf<-cbind(as(caso4_vs_coil_resdf, "data.frame"), as(tax_table(db_ps3)[rownames(caso4_vs_coil_resdf), ], "matrix"))
+write.table(caso4_vs_coil_resdf[order(caso4_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "db_mcb_sigtab.caso4.vs.coil.tsv", sep = "\t")
+
+#Corn Oil vs RFDDGS
+rfddgs_vs_coil_resdf<-results(db_mcb_dds, contrast=c("Diet", "RFDDGS", "Corn_Oil"))
+rfddgs_vs_coil_resdf <- rfddgs_vs_coil_resdf[which(rfddgs_vs_coil_resdf$padj < alpha), ]
+rfddgs_vs_coil_resdf<-cbind(as(rfddgs_vs_coil_resdf, "data.frame"), as(tax_table(db_ps3)[rownames(rfddgs_vs_coil_resdf), ], "matrix"))
+write.table(rfddgs_vs_coil_resdf[order(rfddgs_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "db_mcb_sigtab.rfddgs.vs.coil.tsv", sep = "\t")
+
+```
+
+#### deseq2 Mothur mcb diet:
+```{r warning=F, message=F}
+library("DESeq2")#;packageVersion('DESeq2')
+
+gm_mean = function(x, na.rm=T){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+mb_mcb_dds <- phyloseq_to_deseq2(mb_ps3, ~Diet)
+mb_mcb_dds
+geoMeans <- apply(counts(mb_mcb_dds), 1, gm_mean)
+mb_mcb_dds = estimateSizeFactors(mb_mcb_dds,geoMeans=geoMeans)
+
+mb_mcb_dds = DESeq2::DESeq(mb_mcb_dds, test = "Wald", fitType = "local")
+
+mb_mcb_res = results(mb_mcb_dds)
+resultsNames(mb_mcb_dds)
+
+mb_mcb_res = mb_mcb_res[order(mb_mcb_res$padj, na.last=NA), ]
+alpha = 0.05
+mb_mcb_res1 = cbind(as(mb_mcb_res, "data.frame"), as(tax_table(mb_ps3)[rownames(mb_mcb_res), ], "matrix"))
+mb_mcb_sigtab = mb_mcb_res[(mb_mcb_res$padj < alpha), ]
+mb_mcb_sigtab = cbind(as(mb_mcb_sigtab, "data.frame"), as(tax_table(mb_ps3)[rownames(mb_mcb_sigtab), ], "matrix"))
+#write.table(mb_mcb_sigtab, file = "mb_mcb_sigtab.tsv", sep = "\t")
+
+#Calciumsulfate Corn_Oil RFDDGS Standard
+
+#Standard vs Calciumsulfate
+standard_vs_CaSO4_resdf <- results(mb_mcb_dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+standard_vs_CaSO4_resdf <- standard_vs_CaSO4_resdf[which(standard_vs_CaSO4_resdf$padj < alpha), ]
+standard_vs_CaSO4_resdf<-cbind(as(standard_vs_CaSO4_resdf, "data.frame"), as(tax_table(mb_ps3)[rownames(standard_vs_CaSO4_resdf), ], "matrix"))
+write.table(standard_vs_CaSO4_resdf[order(standard_vs_CaSO4_resdf$log2FoldChange, na.last = NA), ], file = "mb_mcb_sigtab.st.vs.caso4.tsv", sep = "\t")
+
+
+#Standard vs Corn_Oil
+standard_vs_cornoil_resdf<-results(mb_mcb_dds, contrast=c("Diet", "Standard", "Corn_Oil"))
+standard_vs_cornoil_resdf <- standard_vs_cornoil_resdf[which(standard_vs_cornoil_resdf$padj < alpha), ]
+standard_vs_cornoil_resdf<-cbind(as(standard_vs_cornoil_resdf, "data.frame"), as(tax_table(mb_ps3)[rownames(standard_vs_cornoil_resdf), ], "matrix"))
+write.table(standard_vs_cornoil_resdf[order(standard_vs_cornoil_resdf$log2FoldChange, na.last = NA), ], file = "mb_mcb_sigtab.st.vs.coil.tsv", sep = "\t")
+
+#Standard vs RFDDGS
+standard_vs_rfddgs_resdf<-results(mb_mcb_dds, contrast=c("Diet", "Standard", "RFDDGS"))
+standard_vs_rfddgs_resdf <- standard_vs_rfddgs_resdf[which(standard_vs_rfddgs_resdf$padj < alpha), ]
+standard_vs_rfddgs_resdf<-cbind(as(standard_vs_rfddgs_resdf, "data.frame"), as(tax_table(mb_ps3)[rownames(standard_vs_rfddgs_resdf), ], "matrix"))
+write.table(standard_vs_rfddgs_resdf[order(standard_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "mb_mcb_sigtab.st.vs.rfddgs.tsv", sep = "\t")
+
+
+#Calciumsulfate vs RFDDGS no sig dif otus
+#caso4_vs_rfddgs_resdf<-results(mb_mcb_dds, contrast=c("Diet", "Calciumsulfate", "RFDDGS"))
+#caso4_vs_rfddgs_resdf <- caso4_vs_rfddgs_resdf[which(caso4_vs_rfddgs_resdf$padj < alpha), ]
+#caso4_vs_rfddgs_resdf<-cbind(as(caso4_vs_rfddgs_resdf, "data.frame"), as(tax_table(mb_ps3)[rownames(caso4_vs_rfddgs_resdf), ], "matrix"))
+#write.table(caso4_vs_rfddgs_resdf[order(caso4_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "mb_mcb_sigtab.caso4.vs.rfddgs.tsv", sep = "\t")
+
+#Calciumsulfate vs Corn Oil
+caso4_vs_coil_resdf<-results(mb_mcb_dds, contrast=c("Diet", "Calciumsulfate", "Corn_Oil"))
+caso4_vs_coil_resdf <- caso4_vs_coil_resdf[which(caso4_vs_coil_resdf$padj < alpha), ]
+caso4_vs_coil_resdf<-cbind(as(caso4_vs_coil_resdf, "data.frame"), as(tax_table(mb_ps3)[rownames(caso4_vs_coil_resdf), ], "matrix"))
+write.table(caso4_vs_coil_resdf[order(caso4_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "mb_mcb_sigtab.caso4.vs.coil.tsv", sep = "\t")
+
+#Corn Oil vs RFDDGS has no sig diff otus
+#rfddgs_vs_coil_resdf<-results(mb_mcb_dds, contrast=c("Diet", "RFDDGS", "Corn_Oil"))
+#rfddgs_vs_coil_resdf <- rfddgs_vs_coil_resdf[which(rfddgs_vs_coil_resdf$padj < alpha), ]
+#rfddgs_vs_coil_resdf<-cbind(as(rfddgs_vs_coil_resdf, "data.frame"), as(tax_table(mb_ps3)[rownames(rfddgs_vs_coil_resdf), ], "matrix"))
+#write.table(rfddgs_vs_coil_resdf[order(rfddgs_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "mb_mcb_sigtab.rfddgs.vs.coil.tsv", sep = "\t")
+
+```
+
+
+
+#### deseq2 Mothur bd by diet:
+```{r warning=F, message=F}
+library("DESeq2")#;packageVersion('DESeq2')
+
+gm_mean = function(x, na.rm=T){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+mb_bd_dds <- phyloseq_to_deseq2(mb_ps2, ~Diet)
+mb_bd_dds
+geoMeans <- apply(counts(mb_bd_dds), 1, gm_mean)
+mb_bd_dds = estimateSizeFactors(mb_bd_dds,geoMeans=geoMeans)
+
+mb_bd_dds = DESeq2::DESeq(mb_bd_dds, test = "Wald", fitType = "local")
+
+mb_bd_res = results(mb_bd_dds)
+resultsNames(mb_bd_dds)
+
+mb_bd_res = mb_bd_res[order(mb_bd_res$padj, na.last=NA), ]
+alpha = 0.05
+mb_bd_res1 = cbind(as(mb_bd_res, "data.frame"), as(tax_table(mb_ps2)[rownames(mb_bd_res), ], "matrix"))
+mb_bd_sigtab = mb_bd_res[(mb_bd_res$padj < alpha), ]
+mb_bd_sigtab = cbind(as(mb_bd_sigtab, "data.frame"), as(tax_table(mb_ps2)[rownames(mb_bd_sigtab), ], "matrix"))
+write.table(mb_bd_sigtab, file = "mb_bd_sigtab.tsv", sep = "\t")
+
+#Calciumsulfate Corn_Oil RFDDGS Standard
+
+#Standard vs Calciumsulfate
+standard_vs_CaSO4_resdf <- results(mb_bd_dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+standard_vs_CaSO4_resdf <- standard_vs_CaSO4_resdf[which(standard_vs_CaSO4_resdf$padj < alpha), ]
+standard_vs_CaSO4_resdf<-cbind(as(standard_vs_CaSO4_resdf, "data.frame"), as(tax_table(mb_ps2)[rownames(standard_vs_CaSO4_resdf), ], "matrix"))
+write.table(standard_vs_CaSO4_resdf[order(standard_vs_CaSO4_resdf$log2FoldChange, na.last = NA), ], file = "mb_bd_sigtab.st.vs.caso4.tsv", sep = "\t")
+
+
+#Standard vs Corn_Oil
+standard_vs_cornoil_resdf<-results(mb_bd_dds, contrast=c("Diet", "Standard", "Corn_Oil"))
+standard_vs_cornoil_resdf <- standard_vs_cornoil_resdf[which(standard_vs_cornoil_resdf$padj < alpha), ]
+standard_vs_cornoil_resdf<-cbind(as(standard_vs_cornoil_resdf, "data.frame"), as(tax_table(mb_ps2)[rownames(standard_vs_cornoil_resdf), ], "matrix"))
+write.table(standard_vs_cornoil_resdf[order(standard_vs_cornoil_resdf$log2FoldChange, na.last = NA), ], file = "mb_bd_sigtab.st.vs.coil.tsv", sep = "\t")
+
+#Standard vs RFDDGS
+standard_vs_rfddgs_resdf<-results(mb_bd_dds, contrast=c("Diet", "Standard", "RFDDGS"))
+standard_vs_rfddgs_resdf <- standard_vs_rfddgs_resdf[which(standard_vs_rfddgs_resdf$padj < alpha), ]
+standard_vs_rfddgs_resdf<-cbind(as(standard_vs_rfddgs_resdf, "data.frame"), as(tax_table(mb_ps2)[rownames(standard_vs_rfddgs_resdf), ], "matrix"))
+write.table(standard_vs_rfddgs_resdf[order(standard_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "mb_bd_sigtab.st.vs.rfddgs.tsv", sep = "\t")
+
+
+#Calciumsulfate vs RFDDGS no sig dif otus
+#caso4_vs_rfddgs_resdf<-results(mb_bd_dds, contrast=c("Diet", "Calciumsulfate", "RFDDGS"))
+#caso4_vs_rfddgs_resdf <- caso4_vs_rfddgs_resdf[which(caso4_vs_rfddgs_resdf$padj < alpha), ]
+#caso4_vs_rfddgs_resdf<-cbind(as(caso4_vs_rfddgs_resdf, "data.frame"), as(tax_table(mb_ps2)[rownames(caso4_vs_rfddgs_resdf), ], "matrix"))
+#write.table(caso4_vs_rfddgs_resdf[order(caso4_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "mb_bd_sigtab.caso4.vs.rfddgs.tsv", sep = "\t")
+
+#Calciumsulfate vs Corn Oil
+caso4_vs_coil_resdf<-results(mb_bd_dds, contrast=c("Diet", "Calciumsulfate", "Corn_Oil"))
+caso4_vs_coil_resdf <- caso4_vs_coil_resdf[which(caso4_vs_coil_resdf$padj < alpha), ]
+caso4_vs_coil_resdf<-cbind(as(caso4_vs_coil_resdf, "data.frame"), as(tax_table(mb_ps2)[rownames(caso4_vs_coil_resdf), ], "matrix"))
+write.table(caso4_vs_coil_resdf[order(caso4_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "mb_bd_sigtab.caso4.vs.coil.tsv", sep = "\t")
+
+#Corn Oil vs RFDDGS
+#rfddgs_vs_coil_resdf<-results(mb_bd_dds, contrast=c("Diet", "RFDDGS", "Corn_Oil"))
+#rfddgs_vs_coil_resdf <- rfddgs_vs_coil_resdf[which(rfddgs_vs_coil_resdf$padj < alpha), ]
+#rfddgs_vs_coil_resdf<-cbind(as(rfddgs_vs_coil_resdf, "data.frame"), as(tax_table(mb_ps2)[rownames(rfddgs_vs_coil_resdf), ], "matrix"))
+#write.table(rfddgs_vs_coil_resdf[order(rfddgs_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "mb_bd_sigtab.rfddgs.vs.coil.tsv", sep = "\t")
+
+```
+
+#### deseq2 USEARCH bd by diet:
+```{r warning=F, message=F}
+library("DESeq2")#;packageVersion('DESeq2')
+
+gm_mean = function(x, na.rm=T){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+ub_bd_dds <- phyloseq_to_deseq2(uparse_ps2, ~Diet)
+ub_bd_dds
+geoMeans <- apply(counts(ub_bd_dds), 1, gm_mean)
+ub_bd_dds = estimateSizeFactors(ub_bd_dds,geoMeans=geoMeans)
+
+ub_bd_dds = DESeq2::DESeq(ub_bd_dds, test = "Wald", fitType = "local")
+
+ub_bd_res = results(ub_bd_dds)
+resultsNames(ub_bd_dds)
+
+ub_bd_res = ub_bd_res[order(ub_bd_res$padj, na.last=NA), ]
+alpha = 0.05
+ub_bd_res1 = cbind(as(ub_bd_res, "data.frame"), as(tax_table(uparse_ps2)[rownames(ub_bd_res), ], "matrix"))
+ub_bd_sigtab = ub_bd_res[(ub_bd_res$padj < alpha), ]
+ub_bd_sigtab = cbind(as(ub_bd_sigtab, "data.frame"), as(tax_table(uparse_ps2)[rownames(ub_bd_sigtab), ], "matrix"))
+#write.table(ub_bd_sigtab, file = "ub_bd_sigtab.tsv", sep = "\t")
+
+#Calciumsulfate Corn_Oil RFDDGS Standard
+
+#Standard vs Calciumsulfate
+standard_vs_CaSO4_resdf <- results(ub_bd_dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+standard_vs_CaSO4_resdf <- standard_vs_CaSO4_resdf[which(standard_vs_CaSO4_resdf$padj < alpha), ]
+standard_vs_CaSO4_resdf<-cbind(as(standard_vs_CaSO4_resdf, "data.frame"), as(tax_table(uparse_ps2)[rownames(standard_vs_CaSO4_resdf), ], "matrix"))
+write.table(standard_vs_CaSO4_resdf[order(standard_vs_CaSO4_resdf$log2FoldChange, na.last = NA), ], file = "ub_bd_sigtab.st.vs.caso4.tsv", sep = "\t")
+
+
+#Standard vs Corn_Oil
+standard_vs_cornoil_resdf<-results(ub_bd_dds, contrast=c("Diet", "Standard", "Corn_Oil"))
+standard_vs_cornoil_resdf <- standard_vs_cornoil_resdf[which(standard_vs_cornoil_resdf$padj < alpha), ]
+standard_vs_cornoil_resdf<-cbind(as(standard_vs_cornoil_resdf, "data.frame"), as(tax_table(uparse_ps2)[rownames(standard_vs_cornoil_resdf), ], "matrix"))
+write.table(standard_vs_cornoil_resdf[order(standard_vs_cornoil_resdf$log2FoldChange, na.last = NA), ], file = "ub_bd_sigtab.st.vs.coil.tsv", sep = "\t")
+
+#Standard vs RFDDGS
+standard_vs_rfddgs_resdf<-results(ub_bd_dds, contrast=c("Diet", "Standard", "RFDDGS"))
+standard_vs_rfddgs_resdf <- standard_vs_rfddgs_resdf[which(standard_vs_rfddgs_resdf$padj < alpha), ]
+standard_vs_rfddgs_resdf<-cbind(as(standard_vs_rfddgs_resdf, "data.frame"), as(tax_table(uparse_ps2)[rownames(standard_vs_rfddgs_resdf), ], "matrix"))
+write.table(standard_vs_rfddgs_resdf[order(standard_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "ub_bd_sigtab.st.vs.rfddgs.tsv", sep = "\t")
+
+
+#Calciumsulfate vs RFDDGS no sig dif otus
+caso4_vs_rfddgs_resdf<-results(ub_bd_dds, contrast=c("Diet", "Calciumsulfate", "RFDDGS"))
+caso4_vs_rfddgs_resdf <- caso4_vs_rfddgs_resdf[which(caso4_vs_rfddgs_resdf$padj < alpha), ]
+caso4_vs_rfddgs_resdf<-cbind(as(caso4_vs_rfddgs_resdf, "data.frame"), as(tax_table(uparse_ps2)[rownames(caso4_vs_rfddgs_resdf), ], "matrix"))
+write.table(caso4_vs_rfddgs_resdf[order(caso4_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "ub_bd_sigtab.caso4.vs.rfddgs.tsv", sep = "\t")
+
+#Calciumsulfate vs Corn Oil
+caso4_vs_coil_resdf<-results(ub_bd_dds, contrast=c("Diet", "Calciumsulfate", "Corn_Oil"))
+caso4_vs_coil_resdf <- caso4_vs_coil_resdf[which(caso4_vs_coil_resdf$padj < alpha), ]
+caso4_vs_coil_resdf<-cbind(as(caso4_vs_coil_resdf, "data.frame"), as(tax_table(uparse_ps2)[rownames(caso4_vs_coil_resdf), ], "matrix"))
+write.table(caso4_vs_coil_resdf[order(caso4_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "ub_bd_sigtab.caso4.vs.coil.tsv", sep = "\t")
+
+#Corn Oil vs RFDDGS
+#rfddgs_vs_coil_resdf<-results(ub_bd_dds, contrast=c("Diet", "RFDDGS", "Corn_Oil"))
+#rfddgs_vs_coil_resdf <- rfddgs_vs_coil_resdf[which(rfddgs_vs_coil_resdf$padj < alpha), ]
+#rfddgs_vs_coil_resdf<-cbind(as(rfddgs_vs_coil_resdf, "data.frame"), as(tax_table(uparse_ps2)[rownames(rfddgs_vs_coil_resdf), ], "matrix"))
+#write.table(rfddgs_vs_coil_resdf[order(rfddgs_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "ub_bd_sigtab.rfddgs.vs.coil.tsv", sep = "\t")
+
+```
+#### deseq2 USEARCH mcb by diet:
+```{r warning=F, message=F}
+library("DESeq2")#;packageVersion('DESeq2')
+
+gm_mean = function(x, na.rm=T){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+ub_mcb_dds <- phyloseq_to_deseq2(uparse_ps3, ~Diet)
+ub_mcb_dds
+geoMeans <- apply(counts(ub_mcb_dds), 1, gm_mean)
+ub_mcb_dds = estimateSizeFactors(ub_mcb_dds,geoMeans=geoMeans)
+
+ub_mcb_dds = DESeq2::DESeq(ub_mcb_dds, test = "Wald", fitType = "local")
+
+ub_mcb_res = results(ub_mcb_dds)
+resultsNames(ub_mcb_dds)
+
+ub_mcb_res = ub_mcb_res[order(ub_mcb_res$padj, na.last=NA), ]
+alpha = 0.05
+ub_mcb_res1 = cbind(as(ub_mcb_res, "data.frame"), as(tax_table(uparse_ps3)[rownames(ub_mcb_res), ], "matrix"))
+ub_mcb_sigtab = ub_mcb_res[(ub_mcb_res$padj < alpha), ]
+ub_mcb_sigtab = cbind(as(ub_mcb_sigtab, "data.frame"), as(tax_table(uparse_ps3)[rownames(ub_mcb_sigtab), ], "matrix"))
+#write.table(ub_mcb_sigtab, file = "ub_mcb_sigtab.tsv", sep = "\t")
+
+#Calciumsulfate Corn_Oil RFDDGS Standard
+
+#Standard vs Calciumsulfate
+standard_vs_CaSO4_resdf <- results(ub_mcb_dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+standard_vs_CaSO4_resdf <- standard_vs_CaSO4_resdf[which(standard_vs_CaSO4_resdf$padj < alpha), ]
+standard_vs_CaSO4_resdf<-cbind(as(standard_vs_CaSO4_resdf, "data.frame"), as(tax_table(uparse_ps3)[rownames(standard_vs_CaSO4_resdf), ], "matrix"))
+write.table(standard_vs_CaSO4_resdf[order(standard_vs_CaSO4_resdf$log2FoldChange, na.last = NA), ], file = "ub_mcb_sigtab.st.vs.caso4.tsv", sep = "\t")
+
+
+#Standard vs Corn_Oil
+standard_vs_cornoil_resdf<-results(ub_mcb_dds, contrast=c("Diet", "Standard", "Corn_Oil"))
+standard_vs_cornoil_resdf <- standard_vs_cornoil_resdf[which(standard_vs_cornoil_resdf$padj < alpha), ]
+standard_vs_cornoil_resdf<-cbind(as(standard_vs_cornoil_resdf, "data.frame"), as(tax_table(uparse_ps3)[rownames(standard_vs_cornoil_resdf), ], "matrix"))
+write.table(standard_vs_cornoil_resdf[order(standard_vs_cornoil_resdf$log2FoldChange, na.last = NA), ], file = "ub_mcb_sigtab.st.vs.coil.tsv", sep = "\t")
+
+#Standard vs RFDDGS
+standard_vs_rfddgs_resdf<-results(ub_mcb_dds, contrast=c("Diet", "Standard", "RFDDGS"))
+standard_vs_rfddgs_resdf <- standard_vs_rfddgs_resdf[which(standard_vs_rfddgs_resdf$padj < alpha), ]
+standard_vs_rfddgs_resdf<-cbind(as(standard_vs_rfddgs_resdf, "data.frame"), as(tax_table(uparse_ps3)[rownames(standard_vs_rfddgs_resdf), ], "matrix"))
+write.table(standard_vs_rfddgs_resdf[order(standard_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "ub_mcb_sigtab.st.vs.rfddgs.tsv", sep = "\t")
+
+
+#Calciumsulfate vs RFDDGS no sig dif otus
+caso4_vs_rfddgs_resdf<-results(ub_mcb_dds, contrast=c("Diet", "Calciumsulfate", "RFDDGS"))
+caso4_vs_rfddgs_resdf <- caso4_vs_rfddgs_resdf[which(caso4_vs_rfddgs_resdf$padj < alpha), ]
+caso4_vs_rfddgs_resdf<-cbind(as(caso4_vs_rfddgs_resdf, "data.frame"), as(tax_table(uparse_ps3)[rownames(caso4_vs_rfddgs_resdf), ], "matrix"))
+write.table(caso4_vs_rfddgs_resdf[order(caso4_vs_rfddgs_resdf$log2FoldChange, na.last = NA), ], file = "ub_mcb_sigtab.caso4.vs.rfddgs.tsv", sep = "\t")
+
+#Calciumsulfate vs Corn Oil
+caso4_vs_coil_resdf<-results(ub_mcb_dds, contrast=c("Diet", "Calciumsulfate", "Corn_Oil"))
+caso4_vs_coil_resdf <- caso4_vs_coil_resdf[which(caso4_vs_coil_resdf$padj < alpha), ]
+caso4_vs_coil_resdf<-cbind(as(caso4_vs_coil_resdf, "data.frame"), as(tax_table(uparse_ps3)[rownames(caso4_vs_coil_resdf), ], "matrix"))
+write.table(caso4_vs_coil_resdf[order(caso4_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "ub_mcb_sigtab.caso4.vs.coil.tsv", sep = "\t")
+
+#Corn Oil vs RFDDGS
+#rfddgs_vs_coil_resdf<-results(ub_mcb_dds, contrast=c("Diet", "RFDDGS", "Corn_Oil"))
+#rfddgs_vs_coil_resdf <- rfddgs_vs_coil_resdf[which(rfddgs_vs_coil_resdf$padj < alpha), ]
+#rfddgs_vs_coil_resdf<-cbind(as(rfddgs_vs_coil_resdf, "data.frame"), as(tax_table(uparse_ps3)[rownames(rfddgs_vs_coil_resdf), ], "matrix"))
+#write.table(rfddgs_vs_coil_resdf[order(rfddgs_vs_coil_resdf$log2FoldChange, na.last = NA), ], file = "ub_mcb_sigtab.rfddgs.vs.coil.tsv", sep = "\t")
+
+```
+
+
+
+
+
+
+#### DESeq2 differential abundance heatmap DADA2 bd:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(t(db_ps2), sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Breed)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds)
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[12]
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+
+df$Diet <- recode(df$Diet, Calciumsulfate = "SULFATE" , Corn_Oil= 'OIL',
+                                      RFDDGS = 'RFDDGS',
+                                      Standard = 'CONT')
+df$Breed <- recode(df$Breed, jersey = "Jersey" , holstein= 'Holstein')
+print(df)
+annot_colors=list(Breed=c(Holstein="#899DA4",Jersey="#C93312"),
+                  Diet=c(SULFATE="#E2D200", OIL='#46ACC8', RFDDGS='#E58601', CONT='#B40F20'))
+heatmap <- pheatmap::pheatmap(deseq2_diff_Counts,scale = "row", 
+                       annotation_col = df,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy", "white", "red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 7, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       filename = "heatmap.test.pdf")
+
+
+print(heatmap)
+
+```
+
+
+
+#### heatmap for mothur bd:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(mb_ps2, sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Breed)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds)
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+#deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[12]
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+
+colnames(df) <- c("Diet", "Breed")
+df$Diet <- recode(df$Diet, Calciumsulfate = "SULFATE" , Corn_Oil= 'OIL',
+                                      RFDDGS = 'RFDDGS',
+                                      Standard = 'CONT')
+df$Breed <- recode(df$Breed, jersey = "Jersey" , holstein= 'Holstein')
+print(df)
+annot_colors=list(Breed=c(Holstein="#899DA4",Jersey="#C93312"),
+                  Diet=c(SULFATE="#E2D200", OIL='#46ACC8', RFDDGS='#E58601', CONT='#B40F20'))
+heatmap <- pheatmap::pheatmap(deseq2_diff_Counts,scale = "row", 
+                       annotation_col = df,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy", "white", "red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 7, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       filename = "mothur_bd.deseq2.heatmap.pdf")
+
+```
+
+#### heatmap for mothur mcb:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(mb_ps3, sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Breed)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds)
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+#deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[,c(10,11,12)]
+length(unique(sigtab$Order))
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+
+anrow <- data.frame(as.factor(tax_vector$Order))
+rownames(anrow) <- rownames(deseq2_diff_Counts)
+colnames(anrow) <- "Order"
+manrow<-anrow
+length(unique(anrow$Order))
+pal24 <- pal_ucscgb()(length(unique(anrow$Order)))
+names(pal24) <- levels(factor(tax_vector$Order))
+
+colnames(df) <- c("Diet", "Breed")
+df$Diet <- recode(df$Diet, Calciumsulfate = "SULFATE" , Corn_Oil= 'OIL',
+                                      RFDDGS = 'RFDDGS',
+                                      Standard = 'CONT')
+df$Breed <- recode(df$Breed, jersey = "Jersey" , holstein= 'Holstein')
+print(df)
+annot_colors=list(Breed=c(Holstein="#899DA4",Jersey="#C93312"),
+                  Diet=c(SULFATE="#E2D200", OIL='#46ACC8', RFDDGS='#E58601', CONT='#B40F20'),
+                  Order=pal24)
+heatmap <- pheatmap::pheatmap(deseq2_diff_Counts,scale = "row", 
+                       annotation_col = df,
+                       annotation_row = anrow,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy","white","red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       show_colnames = F,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 8, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       border_color = NA,
+                       fontsize = 5,
+                       filename = "mothur_mcb.deseq2.heatmap.pdf")
+
+```
+
+#### heatmap for dada2 mcb:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(t(db_ps3), sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Breed)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds)
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+#deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[,c(10,11,12)]
+length(unique(sigtab$Order))
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+
+anrow <- data.frame(as.factor(tax_vector$Order))
+rownames(anrow) <- rownames(deseq2_diff_Counts)
+length(unique(anrow$Order))
+colnames(anrow) <- "Order"
+length(unique(anrow$Order))
+pal24 <- pal_ucscgb()(length(unique(anrow$Order)))
+names(pal24) <- levels(factor(tax_vector$Order))
+danrow<-anrow
+colnames(df) <- c("Diet", "Breed")
+df$Diet <- recode(df$Diet, Calciumsulfate = "SULFATE" , Corn_Oil= 'OIL',
+                                      RFDDGS = 'RFDDGS',
+                                      Standard = 'CONT')
+df$Breed <- recode(df$Breed, jersey = "Jersey" , holstein= 'Holstein')
+print(df)
+annot_colors=list(Breed=c(Holstein="#899DA4",Jersey="#C93312"),
+                  Diet=c(SULFATE="#E2D200", OIL='#46ACC8', RFDDGS='#E58601', CONT='#B40F20'),
+                  Order=pal24)
+heatmap <- pheatmap::pheatmap(deseq2_diff_Counts,scale = "row", 
+                       annotation_col = df,
+                       annotation_row = anrow,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy","white","red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       show_colnames = F,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 8, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       border_color = NA,
+                       fontsize = 5,
+                       filename = "dada2_mcb.deseq2.heatmap.pdf")
+
+```
+
+
+#### heatmap for uparse baseline:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(uparse_ps2, sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Breed)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds)
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+#deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[12]
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+
+colnames(df) <- c("Diet", "Breed")
+df$Diet <- recode(df$Diet, Calciumsulfate = "SULFATE" , Corn_Oil= 'OIL',
+                                      RFDDGS = 'RFDDGS',
+                                      Standard = 'CONT')
+df$Breed <- recode(df$Breed, jersey = "Jersey" , holstein= 'Holstein')
+print(df)
+annot_colors=list(Breed=c(Holstein="#899DA4",Jersey="#C93312"),
+                  Diet=c(SULFATE="#E2D200", OIL='#46ACC8', RFDDGS='#E58601', CONT='#B40F20'))
+heatmap <- pheatmap::pheatmap(deseq2_diff_Counts,scale = "row", 
+                       annotation_col = df,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy", "white", "red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 7, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       filename = "usearch_bd.deseq2.heatmap.pdf")
+
+```
+
+
+#### heatmap for uparse mcb:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(uparse_ps3, sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Breed)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds)
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+#deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[,c(10,11,12)]
+length(unique(sigtab$Order))
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+
+anrow <- data.frame(as.factor(tax_vector$Order))
+rownames(anrow) <- rownames(deseq2_diff_Counts)
+colnames(anrow) <- "Order"
+length(unique(anrow$Order))
+pal24 <- pal_ucscgb()(length(unique(anrow$Order)))
+names(pal24) <- levels(factor(tax_vector$Order))
+uanrow<-anrow
+colnames(df) <- c("Diet", "Breed")
+df$Diet <- recode(df$Diet, Calciumsulfate = "SULFATE" , Corn_Oil= 'OIL',
+                                      RFDDGS = 'RFDDGS',
+                                      Standard = 'CONT')
+df$Breed <- recode(df$Breed, jersey = "Jersey" , holstein= 'Holstein')
+print(df)
+annot_colors=list(Breed=c(Holstein="#899DA4",Jersey="#C93312"),
+                  Diet=c(SULFATE="#E2D200", OIL='#46ACC8', RFDDGS='#E58601', CONT='#B40F20'),
+                  Order=orderpal)
+heatmap <- pheatmap::pheatmap(deseq2_diff_Counts,scale = "row", 
+                       annotation_col = df,
+                       annotation_row = anrow,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy","white","red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       show_colnames = F,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 8, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       border_color = NA,
+                       fontsize = 5,
+                       filename = "uparse_mcb.deseq2.heatmap.pdf") 
+
+tanrow <- c(danrow$Order,manrow$Order,uanrow$Order)
+tanrow <- as.character(unique(tanrow))
+orderpal <- c(pal_d3(palette = "category20b")(20),pal_ucscgb()(8))
+
+names(orderpal) <- tanrow
+
+#ha<- HeatmapAnnotation(Diet = df$Diet,
+ #                      Breed = df$Breed,
+  #                     col = annot_colors)
+
+#uparse_mcb_htmp <- Heatmap(deseq2_diff_Counts, name = "Fold Change", 
+ #                          top_annotation = ha, 
+  #                         cluster_columns = F,
+   #                        row_names_gp = gpar(fontsize = 3),
+    #                       column_names_gp = gpar(fontsize = 3))
+```
+
+#### heatmap for uparse mcb:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(uparse_ps3, sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Diet)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+#deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[12]
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+colnames(deseq2_diff_Counts)
+
+testdf <- data.frame(deseq2_diff_Counts)
+trim_list1 <- subset_samples(uparse_ps3, Diet=="RFDDGS")
+trim_list1 <- colnames(otu_table(trim_list1))
+trim_list2 <- subset_samples(uparse_ps3, Diet=="Corn_Oil")
+trim_list2 <- colnames(otu_table(trim_list2))
+trim_list <- c(trim_list1,trim_list2)
+
+newDF <- testdf[,which((names(testdf) %in% trim_list)==T)]
+
+
+colnames(df) <- c("Diet", "Breed")
+diet_filter <- c("RFDDGS","Corn_Oil")
+annot_df <- df[df$Diet %in% diet_filter,]
+
+annot_colors=list(Breed=c(holstein="#899DA4",jersey="#C93312"),
+                  Diet=c(Corn_Oil="#E2D200", RFDDGS='#B40F20'))
+heatmap <- pheatmap::pheatmap(newDF,scale = "row", 
+                       annotation_col = annot_df,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy", "white", "red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 7, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       filename = "uparse_mcb.deseq2.coil.vs.rfddgsl.heatmap.pdf")
+
+```
+#### heatmap for uparse bd:
+```{r message=T, warnings=F}
+library(phylosmith)
+library(grid)
+library(gridExtra)
+library(ComplexHeatmap)
+library(pheatmap)
+library(extrafontdb)
+library(extrafont)
+library(DESeq2)
+s <- set_sample_order(uparse_ps2, sort_on = c('Breed','Diet'))
+head(otu_table(s))
+r<-as(sample_data(s),'matrix')
+
+dds <- phyloseq_to_deseq2(s, ~Diet)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq(dds, test = "Wald", fitType = "local")
+
+res = results(dds, contrast=c("Diet", "Standard", "Calciumsulfate"))
+resultsNames(dds)
+
+res = res[order(res$padj, na.last=NA), ]
+alpha = 0.05
+
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(s)[rownames(sigtab), ], "matrix"))
+
+View(sigtab)
+
+df <- as.data.frame(colData(dds)[,c("Diet","Breed")])
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#Get 25 top varying genes
+#topVarGenes <- head(order(rowVars(assay(vsd)), decreasing=T ),10)
+#order(rowVars(assay(vsd)))
+
+#sig_tax_vector <- c("ASV19","ASV196","ASV1","ASV381","ASV261","ASV357","ASV251","ASV13","ASV348")
+sig_tax_vector <- row.names(sigtab)
+#make a subset of the log transformed counts for just the top 25 varying genes
+#deseq2_diff_Counts<-assay(dds)[sig_tax_vector,]
+deseq2_diff_Counts<-assay(vsd)[sig_tax_vector,]
+#ddif2<- rel[sig_tax_vector,]
+#Use pheatmap function to draw a heatmap
+#INCLUDE NEXT LINE IF YOU WANT TO SAVE THE FIGURE IN A FILE
+#pdf(file="gene.heatmap.pdf")
+
+tax_vector <- sigtab[12]
+row.names(tax_vector)<-row.names(sigtab)
+tax_vector <- cbind(tax_vector,row.names(tax_vector))
+tax_vector$col3 <- paste(tax_vector$`row.names(tax_vector)`,tax_vector$Genus, sep = "-")
+
+
+rownames(deseq2_diff_Counts) <- tax_vector$col3
+rownames(deseq2_diff_Counts)
+colnames(deseq2_diff_Counts)
+
+testdf <- data.frame(deseq2_diff_Counts)
+trim_list1 <- subset_samples(uparse_ps3, Diet=="RFDDGS")
+trim_list1 <- colnames(otu_table(trim_list1))
+trim_list2 <- subset_samples(uparse_ps3, Diet=="Corn_Oil")
+trim_list2 <- colnames(otu_table(trim_list2))
+trim_list <- c(trim_list1,trim_list2)
+
+newDF <- testdf[,which((names(testdf) %in% trim_list)==T)]
+
+
+colnames(df) <- c("Diet", "Breed")
+diet_filter <- c("RFDDGS","Corn_Oil")
+annot_df <- df[df$Diet %in% diet_filter,]
+
+annot_colors=list(Breed=c(holstein="#899DA4",jersey="#C93312"),
+                  Diet=c(Corn_Oil="#E2D200", RFDDGS='#B40F20'))
+heatmap <- pheatmap::pheatmap(newDF,scale = "row", 
+                       annotation_col = annot_df,
+                       annotation_colors=annot_colors,
+                       color=colorRampPalette(c("navy", "white", "red"))(50), 
+                       cluster_rows = T, 
+                       cluster_cols = F,
+                       show_rownames=T,
+                       fontsize_col = 2,
+                       fontsize_row = 2,
+                       width = 7, 
+                       height = 5,
+                       clustering_distance_rows = "euclidean",
+                       fontface_row = "italic",
+                       filename = "uparse_mcb.deseq2.coil.vs.rfddgsl.heatmap.pdf")
+
+```
+
+```{r warning=T,message=T}
+diet_deseq2 <- read.delim("diet_deseq2_4R.txt", stringsAsFactors=T)
+breed_deseq2 <- read.delim("breed_deseq2_4R.txt", stringsAsFactors=T)
+
+
+p <- ggplot(breed_deseq2, aes(x =reorder(Family, Family, function(x)-length(x)))) +
+  geom_bar()+theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+p + facet_grid(cols = vars(c(Pipeline)))
+
+ch <- ggplot(breed_deseq2, aes(x =reorder(Family, Family, function(x)-length(x))))
+cha <- ch + geom_bar() 
+chan <- cha + facet_grid(Pipeline ~ Filtration) 
+chang <- chan + theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust = 1, size = 4))
+chang + ggtitle("Chart") + ylim(0,50)
+#ggsave(chang + ylim(0,50), filename = "breed.bar.pdf", height = 8, width = 30)
+
+df <- breed_deseq2 %>% dplyr::count(Family,Pipeline,Filtration,Breed,name = "count", sort = T)
+write.table(df, file = "family_counts.tsv", sep = "\t")
+
+
+df2 <- diet_deseq2 %>% dplyr::count(Family,Pipeline,Filtration,Comaprison,Diet, name = "count", sort = T)
+write.table(df2, file = "diet_counts.tsv", sep = "\t")
+```
+
+
