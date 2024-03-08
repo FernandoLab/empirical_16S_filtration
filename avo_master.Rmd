@@ -35,7 +35,6 @@ library(reshape2)
 library(phyloseq)
 library(metagenomeSeq)
 library(micropower)
-library(randomForest)
 library(ggpubr)
 library(knitr)
 library(kableExtra)
@@ -53,6 +52,7 @@ library(genefilter)
 library(plyr)
 library(data.table)
 library(ranacapa)
+library(phylosmith)
 ```
 
 ```{r message=F, warning=F, echo=F}
@@ -275,7 +275,7 @@ which had a 64bit usearch license:
 `bash /usearch.sh`
 
 DADA2 asv classification:
-```{r, eval=F}
+```{r eval=FALSE}
 path2 <-"fastq/"
 list.files(path2)
 
@@ -347,7 +347,7 @@ head(taxa.print2)
 
 Negative control data with dada2:
 
-```{r,eval=F warning=F, message=F}
+```{r,eval=FALSE}
 path3 <-"negative_control/"
 list.files(path3)
 
@@ -3628,4 +3628,8 @@ df2 <- diet_deseq2 %>% dplyr::count(Family,Pipeline,Filtration,Comaprison,Diet, 
 write.table(df2, file = "diet_counts.tsv", sep = "\t")
 ```
 
-
+### References for all packages and dependencies:
+```{r warning=F, message=F}
+pkg_list <- (.packages())
+knitr::write_bib(pkg_list)
+```
